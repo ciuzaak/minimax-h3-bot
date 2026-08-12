@@ -31,12 +31,36 @@ log = logging.getLogger("minimax-h3-telegram")
 
 ACTIVE_IMAGES = {}
 PENDING_DURATION = {}
-PENDING_ACCELERATION = {}
 PENDING_COUNT = {}
 IMAGE_USE_COUNT = {}
 RETIRED_IMAGES = set()
 PENDING_SERVICE_ACTIONS = {}
 SUBMIT_LOCK = None
+SETTINGS_PATH = PROJECT_DIR / ".runtime" / "bot_settings.json"
+
+
+def load_generation_mode():
+    default = os.environ.get("MINIMAX_DEFAULT_MODE", "fast").strip().lower()
+    default = default if default in {"fast", "standard"} else "fast"
+    try:
+        data = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return default
+    return data.get("generation_mode") if data.get("generation_mode") in {"fast", "standard"} else default
+
+
+def save_generation_mode(mode):
+    SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    temporary = SETTINGS_PATH.with_suffix(".tmp")
+    temporary.write_text(json.dumps({"generation_mode": mode}, ensure_ascii=False) + "\n", encoding="utf-8")
+    temporary.replace(SETTINGS_PATH)
+
+
+GENERATION_MODE = load_generation_mode()
+
+
+def mode_label(mode=None):
+    return "⚡ Fast（Turbo LoRA · 8 步）" if (mode or GENERATION_MODE) == "fast" else "原始模型（20 步）"
 
 
 def allowed(user_id):
@@ -157,20 +181,20 @@ def duration_keyboard(batch_key):
 
 
 def count_keyboard(batch_key):
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(f"{count} 条", callback_data=f"count:{batch_key}:{count}")
+            for count in range(start, start + 4)
+        ]
+        for start in (1, 5)
+    ])
+
+
+def mode_keyboard():
     return InlineKeyboardMarkup([[
-        InlineKeyboardButton("1 条", callback_data=f"count:{batch_key}:1"),
-        InlineKeyboardButton("2 条", callback_data=f"count:{batch_key}:2"),
-        InlineKeyboardButton("4 条", callback_data=f"count:{batch_key}:4"),
-        InlineKeyboardButton("8 条", callback_data=f"count:{batch_key}:8"),
+        InlineKeyboardButton("⚡ Fast（8 步）", callback_data="mode:fast"),
+        InlineKeyboardButton("原始模型（20 步）", callback_data="mode:standard"),
     ]])
-
-
-def acceleration_keyboard(batch_key, turbo_available=True):
-    buttons = []
-    if turbo_available:
-        buttons.append(InlineKeyboardButton("⚡ 加速（8 步）", callback_data=f"acceleration:{batch_key}:turbo"))
-    buttons.append(InlineKeyboardButton("标准（20 步）", callback_data=f"acceleration:{batch_key}:standard"))
-    return InlineKeyboardMarkup([buttons])
 
 
 def service_gpu_keyboard(action, action_key):
@@ -221,7 +245,7 @@ def retire_image(path):
 
 def discard_pending(predicate):
     discarded = 0
-    for pending in (PENDING_DURATION, PENDING_ACCELERATION, PENDING_COUNT):
+    for pending in (PENDING_DURATION, PENDING_COUNT):
         for batch_key, batch in list(pending.items()):
             if predicate(batch):
                 pending.pop(batch_key)
@@ -296,9 +320,9 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "1. 先发一张图片。\n"
         "2. 收到提醒后发送一个提示词；整条消息视为同一个提示词。\n"
         "   提示词中的每段 <中文台词> 都会自动转换为 H3 中文对白格式。\n"
-        "3. 选择 5、10 或 15 秒。\n"
-        "4. 选择加速（Turbo LoRA，8 步）或标准（20 步）模式。\n"
-        "5. 选择生成 1、2、4 或 8 条，系统会为每条使用不同随机 seed。\n"
+        f"3. 当前全局模式：{mode_label()}；使用 /mode 随时修改。\n"
+        "4. 选择 5、10 或 15 秒。\n"
+        "5. 选择生成 1–8 条；也可在提示词末尾写 xN（如 x12）直接指定任意正整数数量。\n"
         "6. 每条视频生成好后会立即发回，并显示生成和排队耗时。\n"
         "7. 在发送新图片前，后续所有普通文字都会继续使用最近一张图片。\n"
         "8. 使用 /progress 查看各 GPU worker 的生成和排队进度。\n"
@@ -311,6 +335,38 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def id_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status = "已在白名单" if allowed(update.effective_user.id) else "不在白名单"
     await update.message.reply_text(f"你的 Telegram ID：{update.effective_user.id}\n{status}")
+
+
+async def mode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update.effective_user.id):
+        await update.message.reply_text("你不在使用白名单中。")
+        return
+    await update.message.reply_text(
+        f"当前全局生成模式：{mode_label()}\n修改后将用于随后创建的新任务。",
+        reply_markup=mode_keyboard(),
+    )
+
+
+async def on_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global GENERATION_MODE
+    query = update.callback_query
+    if not allowed(update.effective_user.id):
+        await query.answer("你不在使用白名单中", show_alert=True)
+        return
+    mode = query.data.split(":", 1)[1]
+    if mode == "fast":
+        try:
+            turbo_issues = await asyncio.to_thread(submit.check_turbo_support)
+        except Exception as error:
+            turbo_issues = [str(error)]
+        if turbo_issues:
+            await query.answer("Fast 组件当前不可用", show_alert=True)
+            await query.edit_message_text("无法切换到 Fast：\n" + "\n".join(turbo_issues))
+            return
+    GENERATION_MODE = mode
+    save_generation_mode(mode)
+    await query.answer("全局模式已修改")
+    await query.edit_message_text(f"全局生成模式已切换为：{mode_label(mode)}")
 
 
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -336,7 +392,7 @@ async def progress_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pending = sum(item["pending"] for item in snapshot)
     choosing = sum(
         batch["user_id"] == update.effective_user.id and batch["chat_id"] == update.effective_chat.id
-        for batch in [*PENDING_DURATION.values(), *PENDING_ACCELERATION.values(), *PENDING_COUNT.values()]
+        for batch in [*PENDING_DURATION.values(), *PENDING_COUNT.values()]
     )
     lines = [f"任务进度：运行中 {running}，排队 {pending}，等待选择 {choosing}"]
     for item in snapshot:
@@ -530,7 +586,7 @@ async def on_prompt_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("请先发送一张图片。")
         return
 
-    raw_prompt = update.message.text.strip()
+    raw_prompt, requested_count = submit.extract_prompt_count(update.message.text)
     if not raw_prompt:
         await send_text_with_retry(context.bot, update.effective_chat.id, "没有读到有效提示词，请重新输入。")
         return
@@ -547,12 +603,16 @@ async def on_prompt_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state = dict(state)
     state["prompt"] = prompt
     state["display_prompt"] = raw_prompt
+    state["requested_count"] = requested_count
+    state["accelerated"] = GENERATION_MODE == "fast"
     acquire_image(state["image_path"])
     PENDING_DURATION[batch_key] = state
     await send_text_with_retry(
         context.bot,
         update.effective_chat.id,
-        ("已自动转换其中的中文台词。" if dialogue_expanded else "提示词已收到。") + "请选择视频时长：",
+        ("已自动转换其中的中文台词。" if dialogue_expanded else "提示词已收到。")
+        + (f"已指定生成 {requested_count} 条。" if requested_count else "")
+        + f"当前使用 {mode_label('fast' if state['accelerated'] else 'standard')}。请选择视频时长：",
         reply_markup=duration_keyboard(batch_key),
     )
 
@@ -585,7 +645,7 @@ def format_elapsed(seconds):
 
 
 async def deliver_video(application, chat_id, record, output_path):
-    mode = "⚡ 加速（8 步）" if record.get("accelerated") else "标准（20 步）"
+    mode = mode_label("fast" if record.get("accelerated") else "standard")
     caption_lines = [f"完成 · {mode} · 视频 {record['actual_seconds']:.3f} 秒 · seed {record['seed']}"]
     if record.get("render_seconds") is not None:
         timing = f"生成耗时 {format_elapsed(record['render_seconds'])}"
@@ -664,7 +724,7 @@ async def submit_batch(application, batch, seconds, count):
 
         if not records:
             return
-        mode = "⚡ 加速（Turbo LoRA · 8 步）" if batch["accelerated"] else "标准（20 步）"
+        mode = mode_label("fast" if batch["accelerated"] else "standard")
         log.info(
             "BATCH_SUBMITTED count=%d seconds=%d accelerated=%s workers=%d",
             len(records),
@@ -710,68 +770,37 @@ async def on_duration(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     batch = PENDING_DURATION.pop(batch_key)
     seconds = int(seconds_text)
-    acceleration_key = secrets.token_hex(6)
     batch["seconds"] = seconds
-    try:
-        turbo_issues = await asyncio.to_thread(submit.check_turbo_support)
-    except Exception as error:
-        turbo_issues = [str(error)]
-    batch["turbo_available"] = not turbo_issues
-    PENDING_ACCELERATION[acceleration_key] = batch
-    if batch["turbo_available"]:
-        mode_help = (
-            "⚡ 加速：完整 Turbo LoRA，8 步；适合大多数普通运动。\n"
-            "标准：原始模型，20 步；适合高速运动或质量优先。\n"
-            "具体耗时受时长、分辨率和队列影响，完成后会显示本次真实耗时。"
+    requested_count = batch.get("requested_count")
+    selected_mode = "fast" if batch["accelerated"] else "standard"
+    if requested_count is not None:
+        context.application.create_task(
+            submit_batch(context.application, batch, seconds, requested_count)
         )
-    else:
-        mode_help = "⚠️ 加速组件当前未通过预检，本次只能选择标准模式。"
+        try:
+            await query.answer(f"将生成 {requested_count} 条")
+            await query.edit_message_text(
+                f"已选择 {seconds} 秒 · {mode_label(selected_mode)} · 共 {requested_count} 条；"
+                "正在提交，每条使用不同随机 seed……"
+            )
+        except (NetworkError, TimedOut):
+            log.warning("Duration acknowledgement failed, but direct-count batch continues")
+        return
+
+    count_key = secrets.token_hex(6)
+    PENDING_COUNT[count_key] = batch
     try:
         await query.answer(f"已选择 {seconds} 秒")
         await query.edit_message_text(
-            f"已选择 {seconds} 秒。请选择生成模式：\n{mode_help}",
-            reply_markup=acceleration_keyboard(acceleration_key, batch["turbo_available"]),
-        )
-    except (NetworkError, TimedOut):
-        log.warning("Duration acknowledgement failed; retrying acceleration prompt as a new message")
-        await send_text_with_retry(
-            context.application.bot,
-            batch["chat_id"],
-            f"已选择 {seconds} 秒。请选择生成模式：\n{mode_help}",
-            reply_markup=acceleration_keyboard(acceleration_key, batch["turbo_available"]),
-        )
-
-
-async def on_acceleration(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    _, batch_key, mode = query.data.split(":", 2)
-    batch = PENDING_ACCELERATION.get(batch_key)
-    if batch is None:
-        await query.answer("这个选择已经失效", show_alert=True)
-        return
-    if batch["user_id"] != update.effective_user.id or batch["chat_id"] != update.effective_chat.id:
-        await query.answer("这不是你的任务", show_alert=True)
-        return
-    if mode == "turbo" and not batch.get("turbo_available", False):
-        await query.answer("加速组件未通过预检，请选择标准模式", show_alert=True)
-        return
-    batch = PENDING_ACCELERATION.pop(batch_key)
-    batch["accelerated"] = mode == "turbo"
-    count_key = secrets.token_hex(6)
-    PENDING_COUNT[count_key] = batch
-    mode_text = "⚡ 加速（Turbo LoRA · 8 步）" if batch["accelerated"] else "标准（20 步）"
-    try:
-        await query.answer(f"已选择{mode_text}")
-        await query.edit_message_text(
-            f"已选择 {batch['seconds']} 秒 · {mode_text}。请选择生成多少条视频：",
+            f"已选择 {seconds} 秒 · {mode_label(selected_mode)}。请选择生成多少条视频：",
             reply_markup=count_keyboard(count_key),
         )
     except (NetworkError, TimedOut):
-        log.warning("Acceleration acknowledgement failed; retrying count prompt as a new message")
+        log.warning("Duration acknowledgement failed; retrying count prompt as a new message")
         await send_text_with_retry(
             context.application.bot,
             batch["chat_id"],
-            f"已选择 {batch['seconds']} 秒 · {mode_text}。请选择生成多少条视频：",
+            f"已选择 {seconds} 秒 · {mode_label(selected_mode)}。请选择生成多少条视频：",
             reply_markup=count_keyboard(count_key),
         )
 
@@ -789,28 +818,30 @@ async def on_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
     batch = PENDING_COUNT.pop(batch_key)
     count = int(count_text)
     context.application.create_task(submit_batch(context.application, batch, batch["seconds"], count))
-    mode_text = "⚡ 加速（8 步）" if batch["accelerated"] else "标准（20 步）"
+    selected_mode = "fast" if batch["accelerated"] else "standard"
     try:
         await query.answer(f"将生成 {count} 条")
         await query.edit_message_text(
-            f"已选择 {batch['seconds']} 秒 · {mode_text} · 共 {count} 条；正在提交，每条使用不同随机 seed……"
+            f"已选择 {batch['seconds']} 秒 · {mode_label(selected_mode)} · 共 {count} 条；"
+            "正在提交，每条使用不同随机 seed……"
         )
     except (NetworkError, TimedOut):
         log.warning("Count acknowledgement failed, but batch submission continues")
 
 
 async def post_init(application):
-    global SUBMIT_LOCK
+    global GENERATION_MODE, SUBMIT_LOCK
     SUBMIT_LOCK = asyncio.Lock()
     commands = [
         BotCommand("start", "使用说明"),
+        BotCommand("mode", "修改全局 Fast / 原始模型模式"),
+        BotCommand("progress", "查看生成和排队进度"),
         BotCommand("id", "查看 Telegram ID"),
         BotCommand("cancel", "取消尚未提交的任务"),
-        BotCommand("progress", "查看生成和排队进度"),
-        BotCommand("stop", "停止全部生成并清空队列"),
         BotCommand("service_start", "选择卡数并启动 GPU 服务"),
         BotCommand("service_stop", "停止 GPU 服务并保持 Bot 在线"),
         BotCommand("service_restart", "选择卡数并重启 GPU 服务"),
+        BotCommand("stop", "危险：停止全部生成并清空队列"),
     ]
     for scope in (BotCommandScopeDefault(), BotCommandScopeAllPrivateChats()):
         await application.bot.delete_my_commands(scope=scope)
@@ -823,6 +854,10 @@ async def post_init(application):
         turbo_issues = [str(error)]
     if turbo_issues:
         log.warning("TURBO_PREFLIGHT_FAILED %s", " | ".join(turbo_issues))
+        if GENERATION_MODE == "fast":
+            GENERATION_MODE = "standard"
+            save_generation_mode(GENERATION_MODE)
+            log.warning("GENERATION_MODE_FALLBACK mode=standard")
     else:
         log.info("TURBO_PREFLIGHT_OK lora=%s", submit.TURBO_LORA_NAME)
     log.info("BOT_READY username=%s allowlist_size=%d restored_images=%d", bot.username, len(ALLOWLIST), restored)
@@ -840,6 +875,7 @@ def main():
     application = Application.builder().token(TOKEN).request(request).get_updates_request(get_updates_request).concurrent_updates(True).post_init(post_init).build()
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", start_command))
+    application.add_handler(CommandHandler("mode", mode_command))
     application.add_handler(CommandHandler("id", id_command))
     application.add_handler(CommandHandler("cancel", cancel_command))
     application.add_handler(CommandHandler("progress", progress_command))
@@ -851,8 +887,8 @@ def main():
     application.add_handler(MessageHandler(filters.PHOTO, on_photo))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_prompt_text))
     application.add_handler(CallbackQueryHandler(on_duration, pattern=r"^duration:[0-9a-f]+:(5|10|15)$"))
-    application.add_handler(CallbackQueryHandler(on_acceleration, pattern=r"^acceleration:[0-9a-f]+:(turbo|standard)$"))
-    application.add_handler(CallbackQueryHandler(on_count, pattern=r"^count:[0-9a-f]+:(1|2|4|8)$"))
+    application.add_handler(CallbackQueryHandler(on_mode, pattern=r"^mode:(fast|standard)$"))
+    application.add_handler(CallbackQueryHandler(on_count, pattern=r"^count:[0-9a-f]+:[1-8]$"))
     application.add_handler(CallbackQueryHandler(on_service_gpu_count, pattern=r"^service:(start|restart):[0-9a-f]+:[1-8]$"))
     application.add_error_handler(on_error)
     application.run_polling(drop_pending_updates=False, allowed_updates=Update.ALL_TYPES, bootstrap_retries=-1)

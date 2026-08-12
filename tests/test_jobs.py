@@ -2,6 +2,7 @@ import unittest
 
 from minimax_h3.jobs import (
     enforce_no_background_music,
+    extract_prompt_count,
     frame_count,
     image_resolution,
 )
@@ -26,7 +27,15 @@ class JobHelpersTest(unittest.TestCase):
         self.assertEqual(result.count("non_diegetic_music:"), 1)
         self.assertTrue(result.endswith("non_diegetic_music: N/A"))
 
+    def test_trailing_count_accepts_any_positive_integer(self):
+        self.assertEqual(extract_prompt_count("A prompt x2"), ("A prompt", 2))
+        self.assertEqual(extract_prompt_count("A prompt\nX128  "), ("A prompt", 128))
+        self.assertEqual(extract_prompt_count("A prompt x0"), ("A prompt x0", None))
+        self.assertEqual(extract_prompt_count("A prompt x"), ("A prompt x", None))
+
+    def test_count_suffix_does_not_consume_word_endings(self):
+        self.assertEqual(extract_prompt_count("scene helix2"), ("scene helix2", None))
+
 
 if __name__ == "__main__":
     unittest.main()
-

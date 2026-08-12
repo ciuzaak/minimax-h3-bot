@@ -25,6 +25,19 @@ NO_MUSIC_FIELD = "non_diegetic_music: N/A"
 TURBO_LORA_NAME = "h3/minimax_h3_turbo_v4_step600_ema.safetensors"
 TURBO_STEPS = 8
 TURBO_NODE_TYPES = ("MiniMaxH3TurboLoRA", "MiniMaxH3TurboSampler")
+PROMPT_COUNT_PATTERN = re.compile(r"^(.*?)(?<![A-Za-z0-9_])[xX]([1-9][0-9]*)\s*$", re.DOTALL)
+
+
+def extract_prompt_count(prompt):
+    """Return a prompt and an optional trailing positive batch count."""
+    prompt = prompt.strip()
+    match = PROMPT_COUNT_PATTERN.match(prompt)
+    if not match:
+        return prompt, None
+    clean_prompt = match.group(1).rstrip()
+    if not clean_prompt:
+        return prompt, None
+    return clean_prompt, int(match.group(2))
 
 
 def request_json(url, data=None, timeout=30):

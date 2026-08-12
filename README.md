@@ -11,7 +11,7 @@
 - 使用 `tmux` 管理 1–8 个独立 GPU worker
 - JSONL 批量提交，自动分辨率、随机 seed、队列调度和结果记录
 - 支持 MiniMax H3 Turbo LoRA（8 步）与标准模式（默认 20 步）
-- 可选 Telegram Bot：上传图片、选择时长/模式/数量、查看进度和管理 worker
+- 可选 Telegram Bot：上传图片、全局切换 Fast/原始模型、选择时长和数量、查看进度及管理 worker
 - 提供组件验证和端到端 smoke test
 
 > 本项目是社区工具，不是 MiniMax 或 ComfyUI 的官方项目。模型权重受其原始许可证和使用条款约束。
@@ -210,9 +210,20 @@ MINIMAX_ENABLE_TELEGRAM=1
 BOT_PYTHON=/opt/venvs/bot/bin/python
 TG_BOT_TOKEN=123456:replace-me
 TG_ALLOWLIST=123456789,987654321
+MINIMAX_DEFAULT_MODE=fast
 ```
 
 `TG_ALLOWLIST` 是允许使用 Bot 的 Telegram 数字用户 ID，多个 ID 用逗号或空格分隔。首次不知道 ID 时，可先启动 Bot 后使用 `/id` 查看，再立即补好白名单并重启。不要将 Token 提交到 Git。
+
+Bot 使用 `/mode` 修改所有后续新任务共用的生成模式；设置会保存在被 Git 忽略的 `.runtime/bot_settings.json`，重启 Bot 后仍然有效。Fast 使用 Turbo LoRA 8 步，原始模型使用 20 步。模式在收到提示词时固定到该任务，不会在每次提交时重复询问。
+
+数量按钮提供 1–8。也可以在提示词末尾添加 `xN` 直接指定任意正整数数量并跳过数量选择，例如：
+
+```text
+人物转向镜头挥手，背景和光线保持稳定。Audio: quiet room ambience. x12
+```
+
+`xN` 不会进入最终提示词，每条任务仍使用不同的随机 seed。
 
 如果不需要 Bot，留空 `TG_BOT_TOKEN` 或设置 `MINIMAX_ENABLE_TELEGRAM=0`，多 GPU worker 仍可正常启动。
 
