@@ -211,11 +211,12 @@ BOT_PYTHON=/opt/venvs/bot/bin/python
 TG_BOT_TOKEN=123456:replace-me
 TG_ALLOWLIST=123456789,987654321
 MINIMAX_DEFAULT_MODE=fast
+MINIMAX_DEFAULT_SECONDS=5
 ```
 
 `TG_ALLOWLIST` 是允许使用 Bot 的 Telegram 数字用户 ID，多个 ID 用逗号或空格分隔。首次不知道 ID 时，可先启动 Bot 后使用 `/id` 查看，再立即补好白名单并重启。不要将 Token 提交到 Git。
 
-Bot 使用 `/mode` 修改所有后续新任务共用的生成模式；设置会保存在被 Git 忽略的 `.runtime/bot_settings.json`，重启 Bot 后仍然有效。Fast 使用 Turbo LoRA 8 步，原始模型使用 20 步。模式在收到提示词时固定到该任务，不会在每次提交时重复询问。
+Bot 使用 `/mode` 修改所有后续新任务共用的生成模式和时长（5、10 或 15 秒）；设置会保存在被 Git 忽略的 `.runtime/bot_settings.json`，重启 Bot 后仍然有效。Fast 使用 Turbo LoRA 8 步，原始模型使用 20 步。模型和时长在收到提示词时固定到该任务，不会在每次提交时重复询问。
 
 数量按钮提供 1–8。也可以在提示词末尾添加 `xN` 直接指定任意正整数数量并跳过数量选择，例如：
 

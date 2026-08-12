@@ -30,7 +30,6 @@ logging.getLogger("telegram").setLevel(logging.WARNING)
 log = logging.getLogger("minimax-h3-telegram")
 
 ACTIVE_IMAGES = {}
-PENDING_DURATION = {}
 PENDING_COUNT = {}
 IMAGE_USE_COUNT = {}
 RETIRED_IMAGES = set()
@@ -39,28 +38,45 @@ SUBMIT_LOCK = None
 SETTINGS_PATH = PROJECT_DIR / ".runtime" / "bot_settings.json"
 
 
-def load_generation_mode():
+def load_generation_settings():
     default = os.environ.get("MINIMAX_DEFAULT_MODE", "fast").strip().lower()
     default = default if default in {"fast", "standard"} else "fast"
     try:
+        default_seconds = int(os.environ.get("MINIMAX_DEFAULT_SECONDS", "5"))
+    except ValueError:
+        default_seconds = 5
+    default_seconds = default_seconds if default_seconds in {5, 10, 15} else 5
+    try:
         data = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
     except (OSError, ValueError, TypeError):
-        return default
-    return data.get("generation_mode") if data.get("generation_mode") in {"fast", "standard"} else default
+        return default, default_seconds
+    mode = data.get("generation_mode") if data.get("generation_mode") in {"fast", "standard"} else default
+    seconds = data.get("seconds") if data.get("seconds") in {5, 10, 15} else default_seconds
+    return mode, seconds
 
 
-def save_generation_mode(mode):
+def save_generation_settings():
     SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
     temporary = SETTINGS_PATH.with_suffix(".tmp")
-    temporary.write_text(json.dumps({"generation_mode": mode}, ensure_ascii=False) + "\n", encoding="utf-8")
+    temporary.write_text(
+        json.dumps(
+            {"generation_mode": GENERATION_MODE, "seconds": GENERATION_SECONDS},
+            ensure_ascii=False,
+        ) + "\n",
+        encoding="utf-8",
+    )
     temporary.replace(SETTINGS_PATH)
 
 
-GENERATION_MODE = load_generation_mode()
+GENERATION_MODE, GENERATION_SECONDS = load_generation_settings()
 
 
 def mode_label(mode=None):
     return "⚡ Fast（Turbo LoRA · 8 步）" if (mode or GENERATION_MODE) == "fast" else "原始模型（20 步）"
+
+
+def settings_label():
+    return f"{mode_label()} · {GENERATION_SECONDS} 秒"
 
 
 def allowed(user_id):
@@ -172,14 +188,6 @@ def restore_private_chat_images():
     return restored
 
 
-def duration_keyboard(batch_key):
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("5 秒", callback_data=f"duration:{batch_key}:5"),
-        InlineKeyboardButton("10 秒", callback_data=f"duration:{batch_key}:10"),
-        InlineKeyboardButton("15 秒", callback_data=f"duration:{batch_key}:15"),
-    ]])
-
-
 def count_keyboard(batch_key):
     return InlineKeyboardMarkup([
         [
@@ -191,10 +199,16 @@ def count_keyboard(batch_key):
 
 
 def mode_keyboard():
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("⚡ Fast（8 步）", callback_data="mode:fast"),
-        InlineKeyboardButton("原始模型（20 步）", callback_data="mode:standard"),
-    ]])
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("⚡ Fast（8 步）", callback_data="settings:mode:fast"),
+            InlineKeyboardButton("原始模型（20 步）", callback_data="settings:mode:standard"),
+        ],
+        [
+            InlineKeyboardButton(f"{'✓ ' if GENERATION_SECONDS == seconds else ''}{seconds} 秒", callback_data=f"settings:seconds:{seconds}")
+            for seconds in (5, 10, 15)
+        ],
+    ])
 
 
 def service_gpu_keyboard(action, action_key):
@@ -245,7 +259,7 @@ def retire_image(path):
 
 def discard_pending(predicate):
     discarded = 0
-    for pending in (PENDING_DURATION, PENDING_COUNT):
+    for pending in (PENDING_COUNT,):
         for batch_key, batch in list(pending.items()):
             if predicate(batch):
                 pending.pop(batch_key)
@@ -320,15 +334,14 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "1. 先发一张图片。\n"
         "2. 收到提醒后发送一个提示词；整条消息视为同一个提示词。\n"
         "   提示词中的每段 <中文台词> 都会自动转换为 H3 中文对白格式。\n"
-        f"3. 当前全局模式：{mode_label()}；使用 /mode 随时修改。\n"
-        "4. 选择 5、10 或 15 秒。\n"
-        "5. 选择生成 1–8 条；也可在提示词末尾写 xN（如 x12）直接指定任意正整数数量。\n"
-        "6. 每条视频生成好后会立即发回，并显示生成和排队耗时。\n"
-        "7. 在发送新图片前，后续所有普通文字都会继续使用最近一张图片。\n"
-        "8. 使用 /progress 查看各 GPU worker 的生成和排队进度。\n"
-        "9. 使用 /stop 中断所有生成并清空队列。\n"
-        "10. 使用 /service_start、/service_stop、/service_restart 管理 GPU worker。\n"
-        "11. 所有任务固定不生成背景音乐；环境声、人物声音和对白仍可在提示词中指定。\n\n" + status
+        f"3. 当前全局设置：{settings_label()}；使用 /mode 随时修改模型和时长。\n"
+        "4. 选择生成 1–8 条；也可在提示词末尾写 xN（如 x12）直接指定任意正整数数量。\n"
+        "5. 每条视频生成好后会立即发回，并显示生成和排队耗时。\n"
+        "6. 在发送新图片前，后续所有普通文字都会继续使用最近一张图片。\n"
+        "7. 使用 /progress 查看各 GPU worker 的生成和排队进度。\n"
+        "8. 使用 /stop 中断所有生成并清空队列。\n"
+        "9. 使用 /service_start、/service_stop、/service_restart 管理 GPU worker。\n"
+        "10. 所有任务固定不生成背景音乐；环境声、人物声音和对白仍可在提示词中指定。\n\n" + status
     )
 
 
@@ -342,19 +355,19 @@ async def mode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("你不在使用白名单中。")
         return
     await update.message.reply_text(
-        f"当前全局生成模式：{mode_label()}\n修改后将用于随后创建的新任务。",
+        f"当前全局生成设置：{settings_label()}\n修改后将用于随后创建的新任务。",
         reply_markup=mode_keyboard(),
     )
 
 
 async def on_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global GENERATION_MODE
+    global GENERATION_MODE, GENERATION_SECONDS
     query = update.callback_query
     if not allowed(update.effective_user.id):
         await query.answer("你不在使用白名单中", show_alert=True)
         return
-    mode = query.data.split(":", 1)[1]
-    if mode == "fast":
+    _, setting, value = query.data.split(":", 2)
+    if setting == "mode" and value == "fast":
         try:
             turbo_issues = await asyncio.to_thread(submit.check_turbo_support)
         except Exception as error:
@@ -363,10 +376,16 @@ async def on_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer("Fast 组件当前不可用", show_alert=True)
             await query.edit_message_text("无法切换到 Fast：\n" + "\n".join(turbo_issues))
             return
-    GENERATION_MODE = mode
-    save_generation_mode(mode)
-    await query.answer("全局模式已修改")
-    await query.edit_message_text(f"全局生成模式已切换为：{mode_label(mode)}")
+    if setting == "mode":
+        GENERATION_MODE = value
+    else:
+        GENERATION_SECONDS = int(value)
+    save_generation_settings()
+    await query.answer("全局设置已修改")
+    await query.edit_message_text(
+        f"当前全局生成设置：{settings_label()}\n可继续修改另一项。",
+        reply_markup=mode_keyboard(),
+    )
 
 
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -392,7 +411,7 @@ async def progress_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pending = sum(item["pending"] for item in snapshot)
     choosing = sum(
         batch["user_id"] == update.effective_user.id and batch["chat_id"] == update.effective_chat.id
-        for batch in [*PENDING_DURATION.values(), *PENDING_COUNT.values()]
+        for batch in PENDING_COUNT.values()
     )
     lines = [f"任务进度：运行中 {running}，排队 {pending}，等待选择 {choosing}"]
     for item in snapshot:
@@ -605,15 +624,29 @@ async def on_prompt_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state["display_prompt"] = raw_prompt
     state["requested_count"] = requested_count
     state["accelerated"] = GENERATION_MODE == "fast"
+    state["seconds"] = GENERATION_SECONDS
     acquire_image(state["image_path"])
-    PENDING_DURATION[batch_key] = state
+    selected_mode = "fast" if state["accelerated"] else "standard"
+    if requested_count is not None:
+        context.application.create_task(
+            submit_batch(context.application, state, state["seconds"], requested_count)
+        )
+        await send_text_with_retry(
+            context.bot,
+            update.effective_chat.id,
+            ("已自动转换其中的中文台词。" if dialogue_expanded else "提示词已收到。")
+            + f"使用 {mode_label(selected_mode)} · {state['seconds']} 秒 · 共 {requested_count} 条；"
+            "正在提交，每条使用不同随机 seed……",
+        )
+        return
+
+    PENDING_COUNT[batch_key] = state
     await send_text_with_retry(
         context.bot,
         update.effective_chat.id,
         ("已自动转换其中的中文台词。" if dialogue_expanded else "提示词已收到。")
-        + (f"已指定生成 {requested_count} 条。" if requested_count else "")
-        + f"当前使用 {mode_label('fast' if state['accelerated'] else 'standard')}。请选择视频时长：",
-        reply_markup=duration_keyboard(batch_key),
+        + f"当前使用 {mode_label(selected_mode)} · {state['seconds']} 秒。请选择生成多少条视频：",
+        reply_markup=count_keyboard(batch_key),
     )
 
 
@@ -758,53 +791,6 @@ async def submit_batch(application, batch, seconds, count):
         release_image(batch["image_path"])
 
 
-async def on_duration(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    _, batch_key, seconds_text = query.data.split(":", 2)
-    batch = PENDING_DURATION.get(batch_key)
-    if batch is None:
-        await query.answer("这个选择已经失效", show_alert=True)
-        return
-    if batch["user_id"] != update.effective_user.id or batch["chat_id"] != update.effective_chat.id:
-        await query.answer("这不是你的任务", show_alert=True)
-        return
-    batch = PENDING_DURATION.pop(batch_key)
-    seconds = int(seconds_text)
-    batch["seconds"] = seconds
-    requested_count = batch.get("requested_count")
-    selected_mode = "fast" if batch["accelerated"] else "standard"
-    if requested_count is not None:
-        context.application.create_task(
-            submit_batch(context.application, batch, seconds, requested_count)
-        )
-        try:
-            await query.answer(f"将生成 {requested_count} 条")
-            await query.edit_message_text(
-                f"已选择 {seconds} 秒 · {mode_label(selected_mode)} · 共 {requested_count} 条；"
-                "正在提交，每条使用不同随机 seed……"
-            )
-        except (NetworkError, TimedOut):
-            log.warning("Duration acknowledgement failed, but direct-count batch continues")
-        return
-
-    count_key = secrets.token_hex(6)
-    PENDING_COUNT[count_key] = batch
-    try:
-        await query.answer(f"已选择 {seconds} 秒")
-        await query.edit_message_text(
-            f"已选择 {seconds} 秒 · {mode_label(selected_mode)}。请选择生成多少条视频：",
-            reply_markup=count_keyboard(count_key),
-        )
-    except (NetworkError, TimedOut):
-        log.warning("Duration acknowledgement failed; retrying count prompt as a new message")
-        await send_text_with_retry(
-            context.application.bot,
-            batch["chat_id"],
-            f"已选择 {seconds} 秒 · {mode_label(selected_mode)}。请选择生成多少条视频：",
-            reply_markup=count_keyboard(count_key),
-        )
-
-
 async def on_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     _, batch_key, count_text = query.data.split(":", 2)
@@ -834,7 +820,7 @@ async def post_init(application):
     SUBMIT_LOCK = asyncio.Lock()
     commands = [
         BotCommand("start", "使用说明"),
-        BotCommand("mode", "修改全局 Fast / 原始模型模式"),
+        BotCommand("mode", "修改全局模型和视频时长"),
         BotCommand("progress", "查看生成和排队进度"),
         BotCommand("id", "查看 Telegram ID"),
         BotCommand("cancel", "取消尚未提交的任务"),
@@ -856,7 +842,7 @@ async def post_init(application):
         log.warning("TURBO_PREFLIGHT_FAILED %s", " | ".join(turbo_issues))
         if GENERATION_MODE == "fast":
             GENERATION_MODE = "standard"
-            save_generation_mode(GENERATION_MODE)
+            save_generation_settings()
             log.warning("GENERATION_MODE_FALLBACK mode=standard")
     else:
         log.info("TURBO_PREFLIGHT_OK lora=%s", submit.TURBO_LORA_NAME)
@@ -886,8 +872,7 @@ def main():
     application.add_handler(CommandHandler("service_restart", service_restart_command))
     application.add_handler(MessageHandler(filters.PHOTO, on_photo))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_prompt_text))
-    application.add_handler(CallbackQueryHandler(on_duration, pattern=r"^duration:[0-9a-f]+:(5|10|15)$"))
-    application.add_handler(CallbackQueryHandler(on_mode, pattern=r"^mode:(fast|standard)$"))
+    application.add_handler(CallbackQueryHandler(on_mode, pattern=r"^settings:(mode:(fast|standard)|seconds:(5|10|15))$"))
     application.add_handler(CallbackQueryHandler(on_count, pattern=r"^count:[0-9a-f]+:[1-8]$"))
     application.add_handler(CallbackQueryHandler(on_service_gpu_count, pattern=r"^service:(start|restart):[0-9a-f]+:[1-8]$"))
     application.add_error_handler(on_error)
