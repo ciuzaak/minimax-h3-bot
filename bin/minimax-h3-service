@@ -1,0 +1,354 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+ENV_FILE="${MINIMAX_ENV_FILE:-$PROJECT_DIR/.env}"
+if [ -f "$ENV_FILE" ]; then
+    set -a
+    # shellcheck disable=SC1090
+    . "$ENV_FILE"
+    set +a
+fi
+BOT_ENV_FILE="${MINIMAX_BOT_ENV_FILE:-}"
+if [ -n "$BOT_ENV_FILE" ] && [ "$BOT_ENV_FILE" != "$ENV_FILE" ] && [ -f "$BOT_ENV_FILE" ]; then
+    set -a
+    # shellcheck disable=SC1090
+    . "$BOT_ENV_FILE"
+    set +a
+fi
+
+: "${COMFY_DIR:=$PROJECT_DIR/../ComfyUI}"
+: "${COMFY_PYTHON:=python3}"
+: "${BOT_PYTHON:=$COMFY_PYTHON}"
+: "${MINIMAX_MODEL_PATHS_CONFIG:=$PROJECT_DIR/.runtime/extra_model_paths.yaml}"
+: "${MINIMAX_LOG_DIR:=$PROJECT_DIR/logs}"
+: "${MINIMAX_OUTPUT_DIR:=$PROJECT_DIR/output}"
+: "${MINIMAX_BASE_PORT:=8190}"
+: "${MINIMAX_DEFAULT_GPU_COUNT:=1}"
+: "${MINIMAX_MAX_GPU_COUNT:=8}"
+: "${MINIMAX_RESERVE_VRAM:=5}"
+: "${MINIMAX_USE_SAGE_ATTENTION:=1}"
+: "${MINIMAX_ENABLE_TELEGRAM:=${TG_BOT_TOKEN:+1}}"
+
+SESSION="${MINIMAX_TMUX_SESSION:-minimax-h3-service}"
+PYTHON="$COMFY_PYTHON"
+BOT_MODULE="minimax_h3.telegram_bot"
+MODEL_PATHS_CONFIG="$MINIMAX_MODEL_PATHS_CONFIG"
+TURBO_NODE_DIR="${MINIMAX_TURBO_NODE_DIR:-$COMFY_DIR/custom_nodes/ComfyUI-MiniMax-H3-Turbo}"
+TURBO_LORA="${MINIMAX_TURBO_LORA:-$COMFY_DIR/models/loras/h3/minimax_h3_turbo_v4_step600_ema.safetensors}"
+REQUIRED_COMFY_COMMIT="93cb5ed"
+REQUIRED_TURBO_NODE_COMMIT="55fee864dd7b2976b1c4ce3c3d5f7968f181409f"
+TURBO_LORA_SHA256="5f3a626cd72c93a8b9318d6760c510bc5092d2ab13aaba1f932c5bab07a416d3"
+LOG_DIR="$MINIMAX_LOG_DIR"
+OUTPUT_DIR="$MINIMAX_OUTPUT_DIR"
+BASE_PORT="$MINIMAX_BASE_PORT"
+DEFAULT_GPU_COUNT="$MINIMAX_DEFAULT_GPU_COUNT"
+MAX_GPU_COUNT="$MINIMAX_MAX_GPU_COUNT"
+
+validate_runtime() {
+    if ! git -C "$COMFY_DIR" merge-base --is-ancestor "$REQUIRED_COMFY_COMMIT" HEAD; then
+        echo "ComfyUI is missing the required MiniMax H3 audio fixes ($REQUIRED_COMFY_COMMIT)." >&2
+        exit 1
+    fi
+    if [ ! -d "$TURBO_NODE_DIR/.git" ] || ! git -C "$TURBO_NODE_DIR" merge-base --is-ancestor "$REQUIRED_TURBO_NODE_COMMIT" HEAD; then
+        echo "MiniMax H3 Turbo custom node is missing or older than $REQUIRED_TURBO_NODE_COMMIT." >&2
+        exit 1
+    fi
+    if [ ! -f "$TURBO_LORA" ]; then
+        echo "Turbo LoRA is missing: $TURBO_LORA" >&2
+        exit 1
+    fi
+    actual_lora_sha=$(sha256sum "$TURBO_LORA" | awk '{print $1}')
+    if [ "$actual_lora_sha" != "$TURBO_LORA_SHA256" ]; then
+        echo "Turbo LoRA checksum mismatch: $TURBO_LORA" >&2
+        exit 1
+    fi
+    PYTHONPATH="$PROJECT_DIR${PYTHONPATH:+:$PYTHONPATH}" "$PYTHON" \
+        -c 'from minimax_h3.config import ensure_model_paths_config; ensure_model_paths_config()'
+    if [ "$MINIMAX_USE_SAGE_ATTENTION" = "1" ] && ! "$PYTHON" -c 'from sageattention import sageattn' >/dev/null 2>&1; then
+        echo "SageAttention is unavailable in $PYTHON." >&2
+        exit 1
+    fi
+}
+
+validate_gpu_count() {
+    gpu_count="$1"
+    if ! [[ "$gpu_count" =~ ^[0-9]+$ ]] || [ "$gpu_count" -lt 1 ] || [ "$gpu_count" -gt "$MAX_GPU_COUNT" ]; then
+        echo "GPU count must be an integer between 1 and $MAX_GPU_COUNT." >&2
+        exit 2
+    fi
+}
+
+worker_command() {
+    gpu="$1"
+    port=$((BASE_PORT + gpu))
+    sage_arg=""
+    [ "$MINIMAX_USE_SAGE_ATTENTION" = "1" ] && sage_arg="--use-sage-attention"
+    echo "cd '$COMFY_DIR' && CUDA_VISIBLE_DEVICES=$gpu PYTORCH_ALLOC_CONF=expandable_segments:True '$PYTHON' main.py --listen 127.0.0.1 --port $port --output-directory '$OUTPUT_DIR' --extra-model-paths-config '$MODEL_PATHS_CONFIG' --reserve-vram '$MINIMAX_RESERVE_VRAM' $sage_arg --disable-auto-launch --disable-all-custom-nodes --whitelist-custom-nodes ComfyUI-MiniMax-H3-Turbo --database-url 'sqlite:///:memory:' 2>&1 | tee '$LOG_DIR/minimax-h3-service-gpu$gpu.log'"
+}
+
+worker_windows() {
+    tmux list-windows -t "$SESSION" -F '#W' 2>/dev/null | grep -E '^gpu[0-9]+$' || true
+}
+
+discover_available_gpus() {
+    ignore_own_workers="$1"
+    if ! command -v nvidia-smi >/dev/null 2>&1; then
+        echo "nvidia-smi is unavailable; cannot discover free GPUs." >&2
+        return 1
+    fi
+    own_worker_gpus=""
+    if [ "$ignore_own_workers" = "true" ]; then
+        own_worker_gpus=" $(worker_windows | sed 's/^gpu//' | tr '\n' ' ') "
+    fi
+    AVAILABLE_GPUS=()
+    while IFS= read -r gpu; do
+        gpu="${gpu//[[:space:]]/}"
+        [[ "$gpu" =~ ^[0-9]+$ ]] || continue
+        process_count=0
+        while IFS= read -r process_pid; do
+            process_pid="${process_pid//[[:space:]]/}"
+            [[ "$process_pid" =~ ^[0-9]+$ ]] || continue
+            process_count=$((process_count + 1))
+        done < <(nvidia-smi -i "$gpu" --query-compute-apps=pid --format=csv,noheader,nounits 2>/dev/null || true)
+        if [ "$process_count" -eq 0 ]; then
+            AVAILABLE_GPUS+=("$gpu")
+        elif [ "$ignore_own_workers" = "true" ] && [[ "$own_worker_gpus" == *" $gpu "* ]] && [ "$process_count" -eq 1 ]; then
+            AVAILABLE_GPUS+=("$gpu")
+        fi
+    done < <(nvidia-smi --query-gpu=index --format=csv,noheader,nounits)
+}
+
+select_gpu_indices() {
+    requested_count="$1"
+    ignore_own_workers="$2"
+    discover_available_gpus "$ignore_own_workers"
+    if [ "${#AVAILABLE_GPUS[@]}" -lt "$requested_count" ]; then
+        echo "当前只有 ${#AVAILABLE_GPUS[@]} 张可用空卡，但请求了 $requested_count 张；GPU worker 未作任何变更。" >&2
+        return 1
+    fi
+    SELECTED_GPUS=("${AVAILABLE_GPUS[@]:0:$requested_count}")
+}
+
+start_selected_workers() {
+    selected_gpus=("$@")
+    gpu_count="${#selected_gpus[@]}"
+    mkdir -p "$LOG_DIR" "$OUTPUT_DIR"
+    for gpu in "${selected_gpus[@]}"; do
+        tmux new-window -d -t "$SESSION" -n "gpu$gpu" "$(worker_command "$gpu")"
+    done
+    tmux set-environment -t "$SESSION" MINIMAX_H3_GPU_COUNT "$gpu_count"
+    tmux set-environment -t "$SESSION" MINIMAX_H3_GPU_INDICES "$(IFS=,; echo "${selected_gpus[*]}")"
+
+    echo "正在启动 GPU：${selected_gpus[*]}……"
+    for attempt in $(seq 1 120); do
+        ready=0
+        for gpu in "${selected_gpus[@]}"; do
+            port=$((BASE_PORT + gpu))
+            if curl -fsS "http://127.0.0.1:$port/system_stats" >/dev/null 2>&1; then
+                ready=$((ready + 1))
+            fi
+        done
+        if [ "$ready" -eq "$gpu_count" ]; then
+            echo "GPU worker 已就绪，实际使用：${selected_gpus[*]}。"
+            return
+        fi
+        sleep 1
+    done
+    echo "GPU worker startup timed out. Check $LOG_DIR/minimax-h3-service-gpu*.log" >&2
+    exit 1
+}
+
+start_workers() {
+    gpu_count="${1:-$DEFAULT_GPU_COUNT}"
+    validate_gpu_count "$gpu_count"
+    if ! tmux has-session -t "$SESSION" 2>/dev/null; then
+        echo "The tmux service session is not running; start the full service first." >&2
+        exit 1
+    fi
+    validate_runtime
+    existing=$(worker_windows)
+    if [ -n "$existing" ]; then
+        echo "GPU workers are already running; use workers-restart to change the GPU count." >&2
+        exit 1
+    fi
+    select_gpu_indices "$gpu_count" false
+    start_selected_workers "${SELECTED_GPUS[@]}"
+}
+
+restart_workers() {
+    gpu_count="${1:-$DEFAULT_GPU_COUNT}"
+    validate_gpu_count "$gpu_count"
+    if ! tmux has-session -t "$SESSION" 2>/dev/null; then
+        echo "The tmux service session is not running." >&2
+        exit 1
+    fi
+    validate_runtime
+    select_gpu_indices "$gpu_count" true
+    stop_workers
+    start_selected_workers "${SELECTED_GPUS[@]}"
+}
+
+stop_workers() {
+    if ! tmux has-session -t "$SESSION" 2>/dev/null; then
+        echo "The tmux service session is not running." >&2
+        exit 1
+    fi
+    windows=$(worker_windows)
+    if [ -z "$windows" ]; then
+        echo "GPU workers are already stopped."
+        return
+    fi
+
+    while IFS= read -r window; do
+        [ -n "$window" ] || continue
+        tmux kill-window -t "$SESSION:$window"
+    done <<< "$windows"
+    tmux set-environment -t "$SESSION" MINIMAX_H3_GPU_COUNT 0
+    tmux set-environment -t "$SESSION" MINIMAX_H3_GPU_INDICES ""
+    echo "Stopped $(echo "$windows" | wc -l) GPU worker(s); the Telegram bot remains online."
+}
+
+status_workers() {
+    if ! tmux has-session -t "$SESSION" 2>/dev/null; then
+        echo "The tmux service session is not running." >&2
+        exit 1
+    fi
+    windows=$(worker_windows)
+    if [ -z "$windows" ]; then
+        echo "GPU workers are stopped; the Telegram bot remains online."
+        return
+    fi
+    count=0
+    ready=0
+    while IFS= read -r window; do
+        [ -n "$window" ] || continue
+        gpu="${window#gpu}"
+        port=$((BASE_PORT + gpu))
+        count=$((count + 1))
+        if curl -fsS "http://127.0.0.1:$port/system_stats" >/dev/null 2>&1; then
+            ready=$((ready + 1))
+        fi
+    done <<< "$windows"
+    echo "GPU workers: $ready/$count ready."
+}
+
+start_service() {
+    gpu_count="${1:-$DEFAULT_GPU_COUNT}"
+    validate_gpu_count "$gpu_count"
+    if tmux has-session -t "$SESSION" 2>/dev/null; then
+        echo "MiniMax H3 service is already running."
+        status_service
+        return
+    fi
+    validate_runtime
+    if [ "$MINIMAX_ENABLE_TELEGRAM" = "1" ] && { ! command -v "$BOT_PYTHON" >/dev/null 2>&1 || [ -z "${TG_BOT_TOKEN:-}" ]; }; then
+        echo "Telegram bot is enabled, but its runtime, script, or TG_BOT_TOKEN is missing." >&2
+        exit 1
+    fi
+    select_gpu_indices "$gpu_count" false
+
+    mkdir -p "$LOG_DIR" "$OUTPUT_DIR"
+    first_worker=true
+    for gpu in "${SELECTED_GPUS[@]}"; do
+        port=$((BASE_PORT + gpu))
+        command=$(worker_command "$gpu")
+        if [ "$first_worker" = "true" ]; then
+            tmux new-session -d -s "$SESSION" -n "gpu$gpu" "$command"
+            first_worker=false
+        else
+            tmux new-window -d -t "$SESSION" -n "gpu$gpu" "$command"
+        fi
+    done
+    tmux set-environment -t "$SESSION" MINIMAX_H3_GPU_COUNT "$gpu_count"
+    tmux set-environment -t "$SESSION" MINIMAX_H3_GPU_INDICES "$(IFS=,; echo "${SELECTED_GPUS[*]}")"
+
+    echo "Starting MiniMax H3 service on GPUs: ${SELECTED_GPUS[*]}..."
+    for attempt in $(seq 1 120); do
+        ready=0
+        for gpu in "${SELECTED_GPUS[@]}"; do
+            port=$((BASE_PORT + gpu))
+            if curl -fsS "http://127.0.0.1:$port/system_stats" >/dev/null 2>&1; then
+                ready=$((ready + 1))
+            fi
+        done
+        if [ "$ready" -eq "$gpu_count" ]; then
+            if [ "$MINIMAX_ENABLE_TELEGRAM" != "1" ]; then
+                echo "MiniMax H3 service is ready on GPU(s) ${SELECTED_GPUS[*]}; Telegram bot disabled."
+                return
+            fi
+            bot_command="cd '$PROJECT_DIR' && set -a && [ ! -f '$ENV_FILE' ] || . '$ENV_FILE'; [ -z '$BOT_ENV_FILE' ] || [ ! -f '$BOT_ENV_FILE' ] || . '$BOT_ENV_FILE'; set +a; PYTHONPATH='$PROJECT_DIR' '$BOT_PYTHON' -m '$BOT_MODULE' 2>&1 | tee '$LOG_DIR/minimax-h3-telegram-bot.log'"
+            tmux new-window -d -t "$SESSION" -n "bot" "$bot_command"
+            sleep 2
+            if ! tmux list-windows -t "$SESSION" -F '#W' | grep -qx 'bot'; then
+                echo "Telegram bot failed to start. Check $LOG_DIR/minimax-h3-telegram-bot.log" >&2
+                exit 1
+            fi
+            bot_state="connecting in background"
+            for bot_attempt in $(seq 1 15); do
+                if grep -q 'BOT_READY' "$LOG_DIR/minimax-h3-telegram-bot.log" 2>/dev/null; then
+                    bot_state="connected"
+                    break
+                fi
+                sleep 1
+            done
+            echo "MiniMax H3 service is ready on GPU(s) ${SELECTED_GPUS[*]}; Telegram bot $bot_state."
+            return
+        fi
+        sleep 1
+    done
+
+    echo "Service startup timed out. Check $LOG_DIR/minimax-h3-service-gpu*.log" >&2
+    exit 1
+}
+
+stop_service() {
+    if tmux has-session -t "$SESSION" 2>/dev/null; then
+        tmux kill-session -t "$SESSION"
+        echo "MiniMax H3 service stopped."
+    else
+        echo "MiniMax H3 service is not running."
+    fi
+}
+
+status_service() {
+    if ! tmux has-session -t "$SESSION" 2>/dev/null; then
+        echo "MiniMax H3 service is not running."
+        return 1
+    fi
+
+    windows=$(worker_windows)
+    while IFS= read -r window; do
+        [ -n "$window" ] || continue
+        gpu="${window#gpu}"
+        port=$((BASE_PORT + gpu))
+        if curl -fsS "http://127.0.0.1:$port/system_stats" >/dev/null 2>&1; then
+            echo "GPU $gpu: ready on http://127.0.0.1:$port"
+        else
+            echo "GPU $gpu: starting or unavailable on port $port"
+        fi
+    done <<< "$windows"
+    if tmux list-windows -t "$SESSION" -F '#W' | grep -qx 'bot' && grep -q 'BOT_READY' "$LOG_DIR/minimax-h3-telegram-bot.log" 2>/dev/null; then
+        echo "Telegram bot: connected"
+    elif tmux list-windows -t "$SESSION" -F '#W' | grep -qx 'bot'; then
+        echo "Telegram bot: connecting"
+    else
+        echo "Telegram bot: unavailable"
+    fi
+}
+
+case "${1:-status}" in
+    start) start_service "${2:-$DEFAULT_GPU_COUNT}" ;;
+    stop) stop_service ;;
+    restart) stop_service; start_service "${2:-$DEFAULT_GPU_COUNT}" ;;
+    status) status_service ;;
+    workers-start) start_workers "${2:-$DEFAULT_GPU_COUNT}" ;;
+    workers-stop) stop_workers ;;
+    workers-restart) restart_workers "${2:-$DEFAULT_GPU_COUNT}" ;;
+    workers-status) status_workers ;;
+    validate) validate_runtime; echo "MiniMax H3 runtime validation passed." ;;
+    *)
+        echo "Usage: $0 {start [1-8]|stop|restart [1-8]|status|workers-start [1-8]|workers-stop|workers-restart [1-8]|workers-status|validate}" >&2
+        exit 2
+        ;;
+esac

@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+if [ -f "${MINIMAX_ENV_FILE:-$PROJECT_DIR/.env}" ]; then
+  set -a
+  # shellcheck disable=SC1090
+  . "${MINIMAX_ENV_FILE:-$PROJECT_DIR/.env}"
+  set +a
+fi
+
+cd "$PROJECT_DIR"
+exec "${COMFY_PYTHON:-python3}" -m minimax_h3.jobs "$@"

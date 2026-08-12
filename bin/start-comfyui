@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+if [ -f "${MINIMAX_ENV_FILE:-$PROJECT_DIR/.env}" ]; then
+  set -a
+  # shellcheck disable=SC1090
+  . "${MINIMAX_ENV_FILE:-$PROJECT_DIR/.env}"
+  set +a
+fi
+
+: "${COMFY_DIR:=$PROJECT_DIR/../ComfyUI}"
+: "${COMFY_PYTHON:=python3}"
+: "${MINIMAX_MODEL_PATHS_CONFIG:=$PROJECT_DIR/.runtime/extra_model_paths.yaml}"
+: "${MINIMAX_RESERVE_VRAM:=5}"
+
+PYTHONPATH="$PROJECT_DIR${PYTHONPATH:+:$PYTHONPATH}" "$COMFY_PYTHON" \
+  -c "from minimax_h3.config import ensure_model_paths_config; print(ensure_model_paths_config())" \
+  >/dev/null
+cd "$COMFY_DIR"
+
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+export PYTORCH_ALLOC_CONF="${PYTORCH_ALLOC_CONF:-expandable_segments:True}"
+
+exec "$COMFY_PYTHON" main.py \
+  --extra-model-paths-config "$MINIMAX_MODEL_PATHS_CONFIG" \
+  --lowvram \
+  --reserve-vram "$MINIMAX_RESERVE_VRAM" \
+  --cpu-vae \
+  "$@"
