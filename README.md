@@ -48,8 +48,8 @@
 ### 1. 克隆并准备 Python 环境
 
 ```bash
-git clone https://github.com/ciuzaak/minimax-h3-comfyui-telegram-bot.git
-cd minimax-h3-comfyui-telegram-bot
+git clone https://github.com/ciuzaak/minimax-h3-bot.git
+cd minimax-h3-bot
 
 # 下载模型所需；也可以安装进独立虚拟环境
 python3 -m pip install -r requirements/download.txt
