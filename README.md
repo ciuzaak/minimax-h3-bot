@@ -1,4 +1,4 @@
-# MiniMax H3 ComfyUI Service
+# MiniMax H3 多 GPU ComfyUI 服务
 
 一套围绕 [ComfyUI](https://github.com/comfyanonymous/ComfyUI) 和 MiniMax H3 的实用脚本：下载并校验模型、启动单卡或多卡图生视频服务、通过 JSONL 批量提交任务，以及可选地用 Telegram Bot 操作服务。
 
@@ -15,6 +15,17 @@
 - 提供组件验证和端到端 smoke test
 
 > 本项目是社区工具，不是 MiniMax 或 ComfyUI 的官方项目。模型权重受其原始许可证和使用条款约束。
+
+## 适用场景
+
+这个仓库适合已经能够运行 ComfyUI、希望把 MiniMax H3 图生视频变成可重复执行的本地服务的用户，尤其适用于：
+
+- 一台机器上有多张 GPU，希望每张卡独立处理任务
+- 需要从 JSONL 批量生成视频，并保留任务、耗时和输出记录
+- 希望通过 Telegram 在手机端提交图片和提示词
+- 需要固定模型文件版本并在启动前校验运行环境
+
+它不是云端托管服务，也不负责安装 NVIDIA 驱动、CUDA、PyTorch 或 ComfyUI。单个生成任务只使用一张 GPU；多 GPU 用于并行处理多个任务。
 
 ## 环境要求
 
@@ -272,12 +283,9 @@ bash -n bin/*
 **Turbo 预检失败**  
 核对自定义节点版本、LoRA 路径与哈希。标准批任务仍可通过普通 ComfyUI 实例执行，但当前 `bin/minimax-h3-service` 的 worker 配置包含 Turbo 运行时预检。
 
-## 公开发布前
+## 安全与许可证
 
-仓库代码和示例已避免提交本机路径、生成结果与凭据。正式公开前，仓库所有者还应选择并添加合适的 `LICENSE`，并确认 MiniMax H3 权重、Turbo LoRA、ComfyUI 及其他依赖各自的许可证允许预期用途。
-
-推荐的 GitHub About 描述：
-
-> Multi-GPU MiniMax H3 image-to-video service for ComfyUI, with verified model downloads, JSONL batch scheduling, audio output, Turbo LoRA, and an optional Telegram bot.
-
-推荐 Topics：`minimax-h3`、`comfyui`、`image-to-video`、`video-generation`、`telegram-bot`、`multi-gpu`。
+- ComfyUI worker 默认只监听 `127.0.0.1`。如果改为监听公网地址，请自行增加防火墙、认证和反向代理，不要直接暴露未经保护的 ComfyUI 接口。
+- `.env`、运行日志、生成结果、Bot 临时文件和本地任务文件已被 `.gitignore` 排除。提交前仍建议运行 `git status`，确认没有误加入 Token、用户 ID、私人图片或本机路径。
+- 如果凭据曾经进入 Git 历史，仅删除当前文件并不安全；应先撤销并轮换凭据，再清理历史。安全问题的报告方式见 [SECURITY.md](SECURITY.md)。
+- 仓库当前未附带开源许可证，因此公开可见不等于获得复制、修改或再分发代码的许可。项目所有者可在确认依赖和模型条款后另行添加合适的 `LICENSE`。
