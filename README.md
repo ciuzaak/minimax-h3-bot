@@ -48,8 +48,8 @@
 ### 1. 克隆并准备 Python 环境
 
 ```bash
-git clone https://github.com/ciuzaak/minimax.git
-cd minimax
+git clone https://github.com/ciuzaak/minimax-h3-comfyui-service.git
+cd minimax-h3-comfyui-service
 
 # 下载模型所需；也可以安装进独立虚拟环境
 python3 -m pip install -r requirements/download.txt
