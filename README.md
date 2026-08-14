@@ -4,6 +4,8 @@
 
 每张 GPU 会运行一个独立的 ComfyUI worker；提交器自动发现可用 worker，并优先把新任务分配给排队较短的实例。生成结果包含视频和模型生成的音频。
 
+当前稳定版本：`v1.0.0`。
+
 ## 功能
 
 - 从 ModelScope 下载 MiniMax H3 I2V / Ref2VA 权重并校验 SHA-256
@@ -282,6 +284,15 @@ bash -n bin/*
 
 **Turbo 预检失败**  
 核对自定义节点版本、LoRA 路径与哈希。标准批任务仍可通过普通 ComfyUI 实例执行，但当前 `bin/minimax-h3-service` 的 worker 配置包含 Turbo 运行时预检。
+
+## 已知局限
+
+- 仅面向 Linux 和 NVIDIA GPU，服务管理依赖 `nvidia-smi` 与 `tmux`，尚未提供 Windows、macOS 或容器化部署方案。
+- 多 GPU 采用“一张卡一个 worker”的任务并行方式，单个任务不能跨 GPU 拆分，也不支持跨主机调度。
+- JSONL 提交器和 Telegram Bot 当前只实现图生视频（I2V）；Ref2VA 目前仅提供权重下载脚本，尚未接入任务协议。
+- `bin/minimax-h3-service` 会统一预检 Turbo 自定义节点和 LoRA，即使只计划提交标准模式任务也需要满足该运行时检查。
+- Telegram Bot 的模型模式和视频时长是所有获准用户共享的全局设置，尚不支持按用户保存独立偏好、配额或优先级。
+- worker 调度主要依据 ComfyUI 队列长度和当前任务进度，不会根据显存占用、预计生成耗时或任务尺寸做资源预测。
 
 ## 安全与许可证
 
