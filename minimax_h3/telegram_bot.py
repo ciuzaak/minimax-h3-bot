@@ -36,6 +36,24 @@ RETIRED_IMAGES = set()
 PENDING_SERVICE_ACTIONS = {}
 SUBMIT_LOCK = None
 SETTINGS_PATH = PROJECT_DIR / ".runtime" / "bot_settings.json"
+DIALOGUE_LANGUAGES = {
+    "Chinese": "中文",
+    "Japanese": "日语",
+    "Korean": "韩语",
+    "English": "英语",
+    "none": "无",
+}
+DIALOGUE_LANGUAGE_BUTTONS = {
+    "Chinese": "🇨🇳",
+    "Japanese": "🇯🇵",
+    "Korean": "🇰🇷",
+    "English": "🇬🇧",
+    "none": "🚫",
+}
+BOT_DURATION_OPTIONS = (5, 10, 15)
+H3_CONTROL_TAG_PATTERN = re.compile(
+    r"^(?:/?d|scenetrans|cutoff|(?:Picture|Subject|Video|Audio)\s+[1-9][0-9]*)$"
+)
 
 
 def load_generation_settings():
@@ -45,14 +63,17 @@ def load_generation_settings():
         default_seconds = int(os.environ.get("MINIMAX_DEFAULT_SECONDS", "5"))
     except ValueError:
         default_seconds = 5
-    default_seconds = default_seconds if default_seconds in {5, 10, 15} else 5
+    default_seconds = default_seconds if default_seconds in BOT_DURATION_OPTIONS else 5
+    default_language = os.environ.get("MINIMAX_DEFAULT_DIALOGUE_LANGUAGE", "Chinese").strip()
+    default_language = default_language if default_language in DIALOGUE_LANGUAGES else "Chinese"
     try:
         data = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
     except (OSError, ValueError, TypeError):
-        return default, default_seconds
+        return default, default_seconds, default_language
     mode = data.get("generation_mode") if data.get("generation_mode") in {"fast", "standard"} else default
-    seconds = data.get("seconds") if data.get("seconds") in {5, 10, 15} else default_seconds
-    return mode, seconds
+    seconds = data.get("seconds") if data.get("seconds") in BOT_DURATION_OPTIONS else default_seconds
+    language = data.get("dialogue_language") if data.get("dialogue_language") in DIALOGUE_LANGUAGES else default_language
+    return mode, seconds, language
 
 
 def save_generation_settings():
@@ -60,7 +81,11 @@ def save_generation_settings():
     temporary = SETTINGS_PATH.with_suffix(".tmp")
     temporary.write_text(
         json.dumps(
-            {"generation_mode": GENERATION_MODE, "seconds": GENERATION_SECONDS},
+            {
+                "generation_mode": GENERATION_MODE,
+                "seconds": GENERATION_SECONDS,
+                "dialogue_language": DIALOGUE_LANGUAGE,
+            },
             ensure_ascii=False,
         ) + "\n",
         encoding="utf-8",
@@ -68,7 +93,7 @@ def save_generation_settings():
     temporary.replace(SETTINGS_PATH)
 
 
-GENERATION_MODE, GENERATION_SECONDS = load_generation_settings()
+GENERATION_MODE, GENERATION_SECONDS, DIALOGUE_LANGUAGE = load_generation_settings()
 
 
 def mode_label(mode=None):
@@ -76,7 +101,13 @@ def mode_label(mode=None):
 
 
 def settings_label():
-    return f"{mode_label()} · {GENERATION_SECONDS} 秒"
+    return f"{mode_label()} · {GENERATION_SECONDS} 秒 · 台词：{DIALOGUE_LANGUAGES[DIALOGUE_LANGUAGE]}"
+
+
+def dialogue_conversion_description():
+    if DIALOGUE_LANGUAGE == "none":
+        return "自动台词转换已关闭；尖括号内容会保持原样，适合手写多语言 H3 对白标签。"
+    return f"每段 <台词> 会自动转换为 H3 {DIALOGUE_LANGUAGES[DIALOGUE_LANGUAGE]}对白格式。"
 
 
 def allowed(user_id):
@@ -100,17 +131,21 @@ def validate_angle_brackets(prompt):
     return opening is None
 
 
-def expand_dialogue_prompt(prompt):
+def expand_dialogue_prompt(prompt, language="Chinese"):
     """Convert every simple <dialogue> span to H3 syntax, preserving all other text."""
+    if language == "none":
+        return prompt, False
+    if language not in DIALOGUE_LANGUAGES:
+        raise ValueError(f"Unsupported dialogue language: {language}")
     changed = False
 
     def replace(match):
         nonlocal changed
         dialogue = match.group(1).strip()
-        if not dialogue or dialogue in {"d", "/d"} or dialogue.startswith("Picture"):
+        if not dialogue or H3_CONTROL_TAG_PATTERN.fullmatch(dialogue):
             return match.group(0)
         changed = True
-        return f"<d>[Chinese] {dialogue}</d>"
+        return f"<d>[{language}] {dialogue}</d>"
 
     expanded = re.sub(r"<([^<>]+)>", replace, prompt)
     return expanded, changed
@@ -205,8 +240,15 @@ def mode_keyboard():
             InlineKeyboardButton("原始模型（20 步）", callback_data="settings:mode:standard"),
         ],
         [
-            InlineKeyboardButton(f"{'✓ ' if GENERATION_SECONDS == seconds else ''}{seconds} 秒", callback_data=f"settings:seconds:{seconds}")
-            for seconds in (5, 10, 15)
+            InlineKeyboardButton(f"{'✓ ' if GENERATION_SECONDS == seconds else ''}{seconds}s", callback_data=f"settings:seconds:{seconds}")
+            for seconds in BOT_DURATION_OPTIONS
+        ],
+        [
+            InlineKeyboardButton(
+                f"{'✓ ' if DIALOGUE_LANGUAGE == language else ''}{DIALOGUE_LANGUAGE_BUTTONS[language]}",
+                callback_data=f"settings:language:{language}",
+            )
+            for language in DIALOGUE_LANGUAGES
         ],
     ])
 
@@ -333,8 +375,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "MiniMax H3 图生视频 Bot\n\n"
         "1. 先发一张图片。\n"
         "2. 收到提醒后发送一个提示词；整条消息视为同一个提示词。\n"
-        "   提示词中的每段 <中文台词> 都会自动转换为 H3 中文对白格式。\n"
-        f"3. 当前全局设置：{settings_label()}；使用 /mode 随时修改模型和时长。\n"
+        f"   {dialogue_conversion_description()}\n"
+        f"3. 当前全局设置：{settings_label()}；使用 /mode 修改模型、时长和自动台词语言，/language 可直接打开同一设置面板。\n"
         "4. 选择生成 1–8 条；也可在提示词末尾写 xN（如 x12）直接指定任意正整数数量。\n"
         "5. 每条视频生成好后会立即发回，并显示生成和排队耗时。\n"
         "6. 在发送新图片前，后续所有普通文字都会继续使用最近一张图片。\n"
@@ -355,13 +397,13 @@ async def mode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("你不在使用白名单中。")
         return
     await update.message.reply_text(
-        f"当前全局生成设置：{settings_label()}\n修改后将用于随后创建的新任务。",
+        f"当前 Bot 全局设置：{settings_label()}\n{dialogue_conversion_description()}\n修改后将用于随后收到的新提示词。",
         reply_markup=mode_keyboard(),
     )
 
 
 async def on_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global GENERATION_MODE, GENERATION_SECONDS
+    global GENERATION_MODE, GENERATION_SECONDS, DIALOGUE_LANGUAGE
     query = update.callback_query
     if not allowed(update.effective_user.id):
         await query.answer("你不在使用白名单中", show_alert=True)
@@ -378,12 +420,14 @@ async def on_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
     if setting == "mode":
         GENERATION_MODE = value
-    else:
+    elif setting == "seconds":
         GENERATION_SECONDS = int(value)
+    else:
+        DIALOGUE_LANGUAGE = value
     save_generation_settings()
     await query.answer("全局设置已修改")
     await query.edit_message_text(
-        f"当前全局生成设置：{settings_label()}\n可继续修改另一项。",
+        f"当前 Bot 全局设置：{settings_label()}\n{dialogue_conversion_description()}\n可继续修改其他选项。",
         reply_markup=mode_keyboard(),
     )
 
@@ -594,7 +638,9 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         retire_image(previous_image)
     await context.bot.send_message(
         update.effective_chat.id,
-        "图片已收到。请发送一个提示词，整条消息（包括换行）会作为同一个提示词。提示词中的每段 <中文台词> 都会自动转换为 H3 中文对白格式，其余文字保持不变。之后在发送新图片前，其他普通文字也会继续使用这张图片。背景音乐固定关闭，仍可指定环境声、人物声音或对白。",
+        "图片已收到。请发送一个提示词，整条消息（包括换行）会作为同一个提示词。"
+        + dialogue_conversion_description()
+        + "其余文字保持不变。之后在发送新图片前，其他普通文字也会继续使用这张图片。背景音乐固定关闭，仍可指定环境声、人物声音或对白。",
     )
 
 
@@ -609,14 +655,14 @@ async def on_prompt_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not raw_prompt:
         await send_text_with_retry(context.bot, update.effective_chat.id, "没有读到有效提示词，请重新输入。")
         return
-    if not validate_angle_brackets(raw_prompt):
+    if DIALOGUE_LANGUAGE != "none" and not validate_angle_brackets(raw_prompt):
         await send_text_with_retry(
             context.bot,
             update.effective_chat.id,
-            "检测到未严格匹配的 < >。请确保每段台词都写成完整的 <中文台词>，不能缺少、多余、嵌套或留空。",
+            "检测到未严格匹配的 < >。请确保每段台词都写成完整的 <台词>，不能缺少、多余、嵌套或留空。也可以在 /language 中选择“无”后手写 H3 对白标签。",
         )
         return
-    prompt, dialogue_expanded = expand_dialogue_prompt(raw_prompt)
+    prompt, dialogue_expanded = expand_dialogue_prompt(raw_prompt, DIALOGUE_LANGUAGE)
 
     batch_key = secrets.token_hex(6)
     state = dict(state)
@@ -634,7 +680,7 @@ async def on_prompt_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_text_with_retry(
             context.bot,
             update.effective_chat.id,
-            ("已自动转换其中的中文台词。" if dialogue_expanded else "提示词已收到。")
+            (f"已自动转换其中的{DIALOGUE_LANGUAGES[DIALOGUE_LANGUAGE]}台词。" if dialogue_expanded else "提示词已收到。")
             + f"使用 {mode_label(selected_mode)} · {state['seconds']} 秒 · 共 {requested_count} 条；"
             "正在提交，每条使用不同随机 seed……",
         )
@@ -644,7 +690,7 @@ async def on_prompt_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_text_with_retry(
         context.bot,
         update.effective_chat.id,
-        ("已自动转换其中的中文台词。" if dialogue_expanded else "提示词已收到。")
+        (f"已自动转换其中的{DIALOGUE_LANGUAGES[DIALOGUE_LANGUAGE]}台词。" if dialogue_expanded else "提示词已收到。")
         + f"当前使用 {mode_label(selected_mode)} · {state['seconds']} 秒。请选择生成多少条视频：",
         reply_markup=count_keyboard(batch_key),
     )
@@ -820,7 +866,8 @@ async def post_init(application):
     SUBMIT_LOCK = asyncio.Lock()
     commands = [
         BotCommand("start", "使用说明"),
-        BotCommand("mode", "修改全局模型和视频时长"),
+        BotCommand("mode", "修改全局模型、时长和台词语言"),
+        BotCommand("language", "修改自动台词语言"),
         BotCommand("progress", "查看生成和排队进度"),
         BotCommand("id", "查看 Telegram ID"),
         BotCommand("cancel", "取消尚未提交的任务"),
@@ -862,6 +909,7 @@ def main():
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", start_command))
     application.add_handler(CommandHandler("mode", mode_command))
+    application.add_handler(CommandHandler("language", mode_command))
     application.add_handler(CommandHandler("id", id_command))
     application.add_handler(CommandHandler("cancel", cancel_command))
     application.add_handler(CommandHandler("progress", progress_command))
@@ -872,7 +920,7 @@ def main():
     application.add_handler(CommandHandler("service_restart", service_restart_command))
     application.add_handler(MessageHandler(filters.PHOTO, on_photo))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_prompt_text))
-    application.add_handler(CallbackQueryHandler(on_mode, pattern=r"^settings:(mode:(fast|standard)|seconds:(5|10|15))$"))
+    application.add_handler(CallbackQueryHandler(on_mode, pattern=r"^settings:(mode:(fast|standard)|seconds:(5|10|15)|language:(Chinese|Japanese|Korean|English|none))$"))
     application.add_handler(CallbackQueryHandler(on_count, pattern=r"^count:[0-9a-f]+:[1-8]$"))
     application.add_handler(CallbackQueryHandler(on_service_gpu_count, pattern=r"^service:(start|restart):[0-9a-f]+:[1-8]$"))
     application.add_error_handler(on_error)
