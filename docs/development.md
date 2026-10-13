@@ -56,6 +56,35 @@ attention-run-01/
 
 提交时让提交器加载对应实验环境，再使用 `python -m minimax_h3.jobs JOBS.jsonl --results RESULTS.jsonl`。结果索引对应 `plan.json` 的 `pairs`，可按场景和 seed 配对。先分别完成预热并单独标记，再比较后续任务；同 seed 不保证不同后端输出逐像素一致。
 
+也可以使用自动评测器，在同一张空闲 GPU 上顺序启动两个实验 worker：
+
+```bash
+MINIMAX_ENV_FILE=/dev/null python3 -m tools.run_attention_ab \
+  .runtime/evaluations/attention-run-01/plan.json \
+  --comfy-dir /path/to/isolated/ComfyUI \
+  --comfy-python /path/to/isolated/venv/bin/python \
+  --model-dir /data/models/MiniMax-H3 \
+  --output-dir .runtime/evaluations/attention-run-01/results \
+  --gpu 1 --port 18290
+```
+
+评测器需要 `nvidia-smi`、已有 ComfyUI、Turbo 节点和模型文件，不会自动安装或下载。它校验任务及输入图像哈希，拒绝使用已有计算进程的 GPU，拒绝绑定已有监听服务的端口，记录软件版本和实际模型哈希，采集整卡显存，保存每条结果，并且只终止自己启动的 worker。`--comfy-python` 保留虚拟环境解释器路径，不将其符号链接解析成基础解释器。
+
+每组先执行一条 0.9 秒请求作为启动预热，不计入测量。它主要用于加载组件，不能保证不同目标长度的内核都已完成编译；需要稳定态数据时应另行安排目标尺寸与时长的预热和重复测量。整卡显存每秒采集一次，可能漏掉更短的峰值。
+
+如果一个组完整完成而另一个组尚未提交测量任务，可以用同一命令附加 `--resume` 继续。只有输入、模型、软件、硬件、预热数和预留显存一致，且已完成组的输出仍存在时才保留结果。部分完成的组需要新实验目录，避免混合多次运行的数据。
+
+汇总配对结果：
+
+```bash
+python3 -m tools.summarize_attention_ab \
+  .runtime/evaluations/attention-run-01/plan.json \
+  .runtime/evaluations/attention-run-01/results \
+  --output .runtime/evaluations/attention-run-01/summary.json
+```
+
+汇总工具按任务索引和 seed 配对，拒绝重复索引、错误 seed 或不同采样设置，只对成功且有耗时的配对计算速度比。它不会给画质评分或自动修改默认配置。首轮本机初筛记录见 [2026-10-13 注意力对照](experiments/attention-ab-2026-10-13.md)。
+
 ## 评测记录与后续 PR
 
 每组保留以下证据：
