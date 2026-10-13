@@ -25,6 +25,10 @@ NO_MUSIC_FIELD = "non_diegetic_music: N/A"
 TURBO_LORA_NAME = "h3/minimax_h3_turbo_v4_step600_ema.safetensors"
 TURBO_STEPS = 8
 TURBO_NODE_TYPES = ("MiniMaxH3TurboLoRA", "MiniMaxH3TurboSampler")
+REFERENCE_MODEL_NAME = "minimax_h3_ref2va_pruned_int8_convrot.safetensors"
+REFERENCE_TURBO_LORA_NAME = "minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors"
+REFERENCE_TURBO_STEPS = 4
+MAX_REFERENCE_IMAGES = 9
 PROMPT_COUNT_PATTERN = re.compile(r"^(.*?)(?<![A-Za-z0-9_])[xX]([1-9][0-9]*)\s*$", re.DOTALL)
 
 
@@ -51,6 +55,20 @@ def request_json(url, data=None, timeout=30):
         raise RuntimeError(f"HTTP {error.code} from {url}: {detail}") from error
 
 
+def job_image_paths(job):
+    task = job.get("task", "i2v")
+    if task not in ("i2v", "reference"):
+        raise ValueError("task must be i2v or reference")
+    paths = job.get("image_paths", [job["image_path"]] if job.get("image_path") else [])
+    if not isinstance(paths, (list, tuple)) or not paths or not all(isinstance(p, str) and p for p in paths):
+        raise ValueError("image_paths must be a non-empty list of image paths")
+    if len(paths) > (MAX_REFERENCE_IMAGES if task == "reference" else 1):
+        raise ValueError("reference supports up to 9 images; i2v requires exactly one image")
+    if job.get("ref_image_size", "match") not in ("match", "max"):
+        raise ValueError("ref_image_size must be match or max")
+    return tuple(paths)
+
+
 def load_jobs(path):
     jobs = []
     with path.open(encoding="utf-8") as stream:
@@ -62,15 +80,22 @@ def load_jobs(path):
                 job = json.loads(line)
             except json.JSONDecodeError as error:
                 raise ValueError(f"Line {line_number}: invalid JSON: {error}") from error
-            missing = [key for key in ("image_path", "prompt", "seconds") if key not in job]
+            if not isinstance(job, dict):
+                raise ValueError(f"Line {line_number}: job must be a JSON object")
+            missing = [key for key in ("prompt", "seconds") if key not in job]
             if missing:
                 raise ValueError(f"Line {line_number}: missing fields: {', '.join(missing)}")
-            image_path = Path(job["image_path"]).expanduser().resolve()
-            if not image_path.is_file():
-                raise ValueError(f"Line {line_number}: image does not exist: {image_path}")
+            paths = []
+            for value in job_image_paths(job):
+                image_path = Path(value).expanduser().resolve()
+                if not image_path.is_file():
+                    raise ValueError(f"Line {line_number}: image does not exist: {image_path}")
+                paths.append(str(image_path))
             if not isinstance(job["prompt"], str) or not job["prompt"].strip():
                 raise ValueError(f"Line {line_number}: prompt must be a non-empty string")
-            job["image_path"] = str(image_path)
+            job["image_path"] = paths[0]
+            if job.get("task") == "reference" or "image_paths" in job:
+                job["image_paths"] = paths
             if job.get("seed") in (None, ""):
                 job["seed"] = secrets.randbelow(2 ** 64)
             else:
@@ -161,26 +186,28 @@ def enforce_no_background_music(prompt):
 
 
 def build_prompt(job, index):
-    staged_image = stage_image(job["image_path"])
-    width, height = image_resolution(job["image_path"], job.get("width"), job.get("height"))
+    image_paths = job_image_paths(job)
+    staged_images = [stage_image(path) for path in image_paths]
+    reference = job.get("task") == "reference"
+    width, height = image_resolution(image_paths[0], job.get("width"), job.get("height"))
     length = frame_count(job["seconds"])
     prefix = output_prefix()
     conditioned_prompt = enforce_no_background_music(job["prompt"])
     accelerated = bool(job.get("accelerated", False))
-    steps = TURBO_STEPS if accelerated else int(job.get("steps", 20))
-    sampler = "minimax_h3_turbo" if accelerated else job.get("sampler", "res_multistep")
+    steps = (REFERENCE_TURBO_STEPS if reference else TURBO_STEPS) if accelerated else int(job.get("steps", 20))
+    sampler = "minimax_h3_turbo" if accelerated and not reference else job.get("sampler", "res_multistep")
     scheduler = "simple" if accelerated else job.get("scheduler", "simple")
     model = ["16", 0] if accelerated else ["2", 0]
     prompt = {
-        "1": {"class_type": "LoadImage", "inputs": {"image": staged_image}},
-        "2": {"class_type": "UNETLoader", "inputs": {"unet_name": "minimax_h3_fl2va_pruned_int8_convrot.safetensors", "weight_dtype": "default"}},
+        "1": {"class_type": "LoadImage", "inputs": {"image": staged_images[0]}},
+        "2": {"class_type": "UNETLoader", "inputs": {"unet_name": REFERENCE_MODEL_NAME if reference else "minimax_h3_fl2va_pruned_int8_convrot.safetensors", "weight_dtype": "default"}},
         "3": {"class_type": "CLIPLoader", "inputs": {"clip_name": "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors", "type": "minimax", "device": "default"}},
         "4": {"class_type": "VAELoader", "inputs": {"vae_name": "minimax_h3_video_vae_fp16.safetensors"}},
         "5": {"class_type": "VAELoader", "inputs": {"vae_name": "minimax_h3_audio_vae_fp32.safetensors"}},
         "6": {"class_type": "MiniMaxH3ImageToVideo", "inputs": {"clip": ["3", 0], "vae": ["4", 0], "prompt": conditioned_prompt, "width": width, "height": height, "length": length, "first_frame": ["1", 0]}},
         "7": {"class_type": "RandomNoise", "inputs": {"noise_seed": job["seed"]}},
         "8": {"class_type": "BasicGuider", "inputs": {"model": model, "conditioning": ["6", 0]}},
-        "9": {"class_type": "MiniMaxH3TurboSampler", "inputs": {}} if accelerated else {"class_type": "KSamplerSelect", "inputs": {"sampler_name": sampler}},
+        "9": {"class_type": "MiniMaxH3TurboSampler", "inputs": {}} if accelerated and not reference else {"class_type": "KSamplerSelect", "inputs": {"sampler_name": sampler}},
         "10": {"class_type": "BasicScheduler", "inputs": {"model": model, "scheduler": scheduler, "steps": steps, "denoise": 1.0}},
         "11": {"class_type": "SamplerCustomAdvanced", "inputs": {"noise": ["7", 0], "guider": ["8", 0], "sampler": ["9", 0], "sigmas": ["10", 0], "latent_image": ["6", 1]}},
         "12": {"class_type": "VAEDecode", "inputs": {"samples": ["11", 0], "vae": ["4", 0]}},
@@ -188,11 +215,23 @@ def build_prompt(job, index):
         "14": {"class_type": "CreateVideo", "inputs": {"images": ["12", 0], "fps": 24.0, "audio": ["13", 0], "bit_depth": 8}},
         "15": {"class_type": "SaveVideo", "inputs": {"video": ["14", 0], "filename_prefix": prefix, "format": "mp4", "codec": "h264"}},
     }
+    if reference:
+        inputs = {"clip": ["3", 0], "vae": ["4", 0], "audio_vae": ["5", 0],
+                  "prompt": conditioned_prompt, "width": width, "height": height,
+                  "length": length, "ref_image_size": job.get("ref_image_size", "match")}
+        for ordinal, image in enumerate(staged_images):
+            node_id = "1" if ordinal == 0 else str(16 + ordinal)
+            prompt[node_id] = {"class_type": "LoadImage", "inputs": {"image": image}}
+            inputs[f"ref_images.ref_image_{ordinal}"] = [node_id, 0]
+        prompt["6"] = {"class_type": "MiniMaxH3ReferenceToVideo", "inputs": inputs}
     if accelerated:
         prompt["16"] = {
             "class_type": "MiniMaxH3TurboLoRA",
             "inputs": {"model": ["2", 0], "lora_name": TURBO_LORA_NAME, "strength": 1.0, "low_vram": False},
         }
+        if reference:
+            prompt["16"] = {"class_type": "LoraLoaderModelOnly", "inputs": {
+                "model": ["2", 0], "lora_name": REFERENCE_TURBO_LORA_NAME, "strength_model": 1.0}}
     metadata = {
         "seed": job["seed"],
         "width": width,
@@ -204,6 +243,8 @@ def build_prompt(job, index):
         "steps": steps,
         "sampler": sampler,
         "scheduler": scheduler,
+        "task": "reference" if reference else "i2v",
+        "reference_count": len(image_paths) if reference else 0,
     }
     return prompt, metadata
 
@@ -280,10 +321,36 @@ def check_turbo_support(servers=None):
     return issues
 
 
+def check_reference_support(servers=None, accelerated=False):
+    issues = []
+    for server in list(servers or check_servers()):
+        try:
+            info = request_json(f"{server}/object_info/MiniMaxH3ReferenceToVideo", timeout=3)
+            if "MiniMaxH3ReferenceToVideo" not in info:
+                issues.append(f"{server} 缺少多图参考节点")
+            models = request_json(f"{server}/models/diffusion_models", timeout=3)
+            if REFERENCE_MODEL_NAME not in models:
+                issues.append(f"{server} 找不到 Ref2VA 模型")
+            if accelerated:
+                info = request_json(f"{server}/object_info/LoraLoaderModelOnly", timeout=3)
+                if "LoraLoaderModelOnly" not in info:
+                    issues.append(f"{server} 缺少 Ref2VA Turbo 加载节点")
+                loras = request_json(f"{server}/models/loras", timeout=3)
+                if REFERENCE_TURBO_LORA_NAME not in loras:
+                    issues.append(f"{server} 找不到 Ref2VA 4 步 LoRA")
+        except Exception as error:
+            issues.append(f"{server} Ref2VA 预检失败：{error}")
+    return issues
+
+
 def submit_job(job, index):
     prompt, metadata = build_prompt(job, index)
     server = select_server(SERVERS)
-    if job.get("accelerated"):
+    if job.get("task") == "reference":
+        issues = check_reference_support([server], job.get("accelerated", False))
+        if issues:
+            raise RuntimeError("多图参考不可用：" + "；".join(issues))
+    elif job.get("accelerated"):
         turbo_issues = check_turbo_support([server])
         if turbo_issues:
             raise RuntimeError("Turbo 加速不可用：" + "；".join(turbo_issues))
