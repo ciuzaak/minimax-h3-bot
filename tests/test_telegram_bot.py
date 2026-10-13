@@ -1,6 +1,7 @@
 import unittest
 
 from minimax_h3.telegram_bot import expand_dialogue_prompt, mode_keyboard, validate_angle_brackets
+from minimax_h3.preferences import GenerationSettings
 
 
 class TelegramBotDialogueTest(unittest.TestCase):
@@ -33,7 +34,7 @@ class TelegramBotDialogueTest(unittest.TestCase):
         self.assertFalse(validate_angle_brackets("<unfinished"))
 
     def test_settings_keyboard_uses_compact_button_rows(self):
-        rows = mode_keyboard().inline_keyboard
+        rows = mode_keyboard(GenerationSettings(), 123).inline_keyboard
         self.assertEqual([button.text.lstrip("✓ ") for button in rows[1]], ["5s", "10s", "15s"])
         self.assertEqual([button.text.lstrip("✓ ") for button in rows[2]], ["🇨🇳", "🇯🇵", "🇰🇷", "🇬🇧", "🚫"])
 
