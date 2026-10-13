@@ -289,15 +289,16 @@ requirements/                 按用途拆分的 Python 依赖
 
 ## 开发与测试
 
-以下检查不需要下载模型或占用 GPU：
+安装测试依赖后，使用与 CI 相同的检查入口；不需要 ComfyUI、模型、GPU 或 Telegram 凭据：
 
 ```bash
-python3 -m compileall -q minimax_h3 tools tests
-python3 -m unittest discover -v
-bash -n bin/*
+python3 -m pip install -r requirements/test.txt
+bash bin/check
 ```
 
-提交前还可以运行 `git diff --check` 检查空白错误。涉及实际模型加载和生成的验证请使用 `tools.validate_i2v` 与 `tools.smoke_i2v`。
+GitHub Actions 在 PR、`main` 和 `codex/**` 分支推送时运行 Python 3.10、3.13、3.14 测试，以及工作流语法和 Shell 语法检查。`Required checks` 汇总所有检查结果，可作为分支保护的必需检查；新增工作流本身不会修改仓库的分支保护设置。
+
+模型或采样变更仍须单独执行 GPU 验证，CPU CI 不代表生成画质已通过。涉及实际模型加载和生成的验证请使用 `tools.validate_i2v` 与 `tools.smoke_i2v`。独立分支开发、CI 和 SageAttention 对照准备方法见 [开发与评测流程](docs/development.md)。
 
 ## 常见问题
 
