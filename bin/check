@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$PROJECT_DIR"
+
+# Tests must not load a developer's .env or Telegram credentials.
+export MINIMAX_ENV_FILE=/dev/null
+export TG_BOT_TOKEN=
+export TG_ALLOWLIST=
+export MINIMAX_DEFAULT_MODE=fast
+export MINIMAX_DEFAULT_SECONDS=5
+export MINIMAX_DEFAULT_DIALOGUE_LANGUAGE=Chinese
+
+"${CHECK_PYTHON:-python3}" -m compileall -q minimax_h3 tools tests
+"${CHECK_PYTHON:-python3}" -m unittest discover -v
+for script in bin/*; do
+    bash -n "$script"
+done
+git diff --check
+
+# CI passes the PR base or push predecessor to check committed changes too.
+if [[ -n "${CHECK_BASE_SHA:-}" && ! "$CHECK_BASE_SHA" =~ ^0+$ ]]; then
+    git diff --check "$CHECK_BASE_SHA" HEAD
+else
+    git show --format= --check HEAD
+fi
