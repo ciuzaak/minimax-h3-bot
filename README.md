@@ -13,7 +13,7 @@
 - 使用 `tmux` 管理 1–8 个独立 GPU worker
 - JSONL 批量提交，自动分辨率、随机 seed、队列调度和结果记录
 - 支持 MiniMax H3 Turbo LoRA（8 步）与标准模式（默认 20 步）
-- 可选 Telegram Bot：上传图片、全局切换 Fast/原始模型、选择时长和数量、查看进度及管理 worker
+- 可选 Telegram Bot：单图首帧或最多 9 张参考图、个人设置、选择时长和数量、查看进度及管理 worker
 - 提供组件验证和端到端 smoke test
 
 > 本项目是社区工具，不是 MiniMax 或 ComfyUI 的官方项目。模型权重受其原始许可证和使用条款约束。
@@ -106,6 +106,9 @@ set +a
 ```bash
 python -m tools.download_i2v
 python -m tools.download_ref2va
+
+# 多图参考 Fast 的专用 4 步 LoRA（标准 20 步不需要）
+python -m tools.download_reference_turbo
 ```
 
 下载脚本读取 `.env` 中的模型目录，完成后逐个校验文件哈希。可通过 `MODELSCOPE_DOWNLOAD_PARALLEL_WORKERS` 调整并行数。
@@ -208,6 +211,14 @@ cp examples/jobs.example.jsonl jobs.jsonl
 - `accelerated`：`true` 使用 Turbo LoRA，固定 8 步
 - `sampler` / `scheduler`：可选的 ComfyUI 采样配置
 
+多图参考任务使用独立的 Ref2VA 模型与有序 `image_paths` 列表：
+
+```json
+{"task":"reference","image_paths":["/data/input/person.jpg","/data/input/cat.jpg"],"prompt":"The person from <Picture 1> sits beside the cat from <Picture 2>. Static camera, quiet room ambience.","seconds":5,"seed":42,"accelerated":true}
+```
+
+`task` 省略时保持单图 I2V 行为。`reference` 接受 1–9 张图片，`<Picture 1>` 对应列表第一张。标准模式默认 20 步；`accelerated:true` 使用专用 Ref2V 4 步 LoRA、原生 `LoraLoaderModelOnly` 与 `res_multistep`，不会使用单图的 Larry LoRA 或自定义 Turbo sampler。`ref_image_size` 可选 `match`（默认，按输出像素面积缩小参考图，较快）或 `max`（保留更多参考细节，可能明显变慢）。输出宽高省略时按第一张图确定，其他图片保持各自比例。
+
 默认等待所有任务完成，并在输入文件旁写入 `*.results.jsonl`。使用 `--no-wait` 可在入队后立即返回，使用 `--results PATH` 可指定结果文件。
 
 ## Telegram Bot（可选）
@@ -233,6 +244,20 @@ MINIMAX_DEFAULT_DIALOGUE_LANGUAGE=Chinese
 Bot 使用 `/mode` 修改你自己的生成模式、时长（5、10 或 15 秒）和自动台词语言；`/language` 是同一设置面板的快捷入口。每位用户的偏好独立保存，并跨聊天生效；群聊中的设置按钮只允许打开面板的用户操作。语言可选中文、日语、韩语、英语或“无”，分别生成 `[Chinese]`、`[Japanese]`、`[Korean]`、`[English]` 标签；选择“无”时不转换或校验尖括号内容，方便手写多语言 `<d>[Language] ...</d>` 标签。设置会保存在被 Git 忽略的 `.runtime/bot_settings.json`，重启 Bot 后仍然有效。Fast 使用 Turbo LoRA 8 步，原始模型使用 20 步。模型、时长和台词语言在收到提示词时固定到该任务，不受之后的设置修改影响。
 
 升级时，旧的共享设置作为所有用户的初始默认值保留；第一次修改偏好时，文件自动迁移为包含默认值和各用户偏好的版本 2 格式。升级前的设置按钮会提示重新打开 `/mode`。启动时若 Turbo 预检失败，会暂时按原始模型提交，不会覆盖保存的 Fast 偏好；组件恢复后重新选择 Fast 或重启 Bot 即可恢复。回退到旧版本前请备份设置文件，旧版本不支持各用户偏好格式。
+
+### 多图参考
+
+1. 在 `/mode` 的最后一行选择“多图参考”，然后发送相册或逐张上传图片。多图模式会追加图片，最多 9 张；默认“单图首帧”模式用新图片替换旧图片，并拒绝相册，避免只取其中一张。
+2. 等待收图完成后的编号预览。相册按 Telegram 消息编号排序，下载完成顺序不会改变图号；收图过程中发送的提示词会提示稍后重试。
+3. 用 `/images` 查看图片及编号，可删除任意图片、将图片上移或清空；`/images clear` 直接清空。修改后的图号以新预览为准，旧面板按钮自动失效。
+4. 提示词写明每张图的用途。例如人物来自 `<Picture 1>`，猫来自 `<Picture 2>`。不要写 `<图1>` 或 `<Picture1>`，开启自动对白转换时它们会被当作台词。
+5. 收到提示词时会固定该任务的全部图片、顺序、模式和时长；之后修改或清空参考图不会改变已经收到的提示词任务。输入集合保存在 `.runtime/bot_inputs.json`，重启后可恢复；该文件及图片均不进入 Git。
+
+多图初始使用标准 20 步，在 `/mode` 可单独选择 Fast 4 步。单图和多图的 Fast 偏好分开保存，切回单图时仍使用原先选择的模式。4 步更快，但可能更锐化、丢失部分参考细节或偏离场景指令，重要结果可切回 20 步复核。
+
+多图 Fast 使用 `minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors`，应放在 ComfyUI 的 `models/loras/` 根目录，或由额外模型路径配置暴露同名文件。先运行 `tools.download_ref2va` 和 `tools.download_reference_turbo` 准备权重。单图与多图的 Fast 预检和运行时回退相互独立；缺少多图 Turbo 时暂用标准 20 步，不覆盖保存的 Fast 偏好。没有 Ref2VA 模型时明确报错，不会悄悄改成单图生成。
+
+模型原生还支持参考视频、视频配套音轨、独立参考音频以及风格提示词；此版本的 Bot 和 JSONL 新入口只接图片。视频或音频参考不能只靠写 `<Video 1>` / `<Audio 1>` 传入。[原生工作流说明](https://docs.comfy.org/tutorials/video/minimax/minimax-h3-native)
 
 数量按钮提供 1–8。也可以在提示词末尾添加 `xN` 直接指定任意正整数数量并跳过数量选择，例如：
 
@@ -292,7 +317,9 @@ bash -n bin/*
 
 - 仅面向 Linux 和 NVIDIA GPU，服务管理依赖 `nvidia-smi` 与 `tmux`，尚未提供 Windows、macOS 或容器化部署方案。
 - 多 GPU 采用“一张卡一个 worker”的任务并行方式，单个任务不能跨 GPU 拆分，也不支持跨主机调度。
-- JSONL 提交器和 Telegram Bot 当前只实现图生视频（I2V）；Ref2VA 目前仅提供权重下载脚本，尚未接入任务协议。
+- JSONL 提交器和 Telegram Bot 支持单图首帧 I2V 与 Ref2VA 图片参考；参考视频、参考音频和首尾帧入口尚未接入。
+- 相册在最后一个已知下载完成后等待约一秒再展示编号；极迟到的更新可能进入下一批。提交前请以最新预览确认图片集合。
+- 切回单图时，如果集合仍有多张图，提交会要求删除多余图片或切回多图，不会静默忽略图片。切换模式、上传图片时不自动提交生成。
 - `bin/minimax-h3-service` 会统一预检 Turbo 自定义节点和 LoRA，即使只计划提交标准模式任务也需要满足该运行时检查。
 - Telegram Bot 尚不支持按用户设置配额或队列优先级。
 - worker 调度主要依据 ComfyUI 队列长度和当前任务进度，不会根据显存占用、预计生成耗时或任务尺寸做资源预测。
