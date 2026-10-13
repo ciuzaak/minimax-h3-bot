@@ -1,0 +1,2 @@
+-r bot.txt
+Pillow>=10,<13
