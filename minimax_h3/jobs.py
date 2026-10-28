@@ -305,6 +305,10 @@ def select_server(servers):
     return min(servers, key=server_schedule_key)
 
 
+class NoWorkersAvailable(RuntimeError):
+    """No online worker is available to determine model capabilities."""
+
+
 def check_servers():
     available = []
     for server in POSSIBLE_SERVERS:
@@ -314,7 +318,7 @@ def check_servers():
             continue
         available.append(server)
     if not available:
-        raise RuntimeError(
+        raise NoWorkersAvailable(
             f"No MiniMax H3 service endpoints are available on ports "
             f"{BASE_PORT}-{BASE_PORT + MAX_GPU_COUNT - 1}"
         )

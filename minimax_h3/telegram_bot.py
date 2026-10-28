@@ -1119,6 +1119,9 @@ async def post_init(application):
     restored = restore_private_chat_images()
     try:
         turbo_issues = await asyncio.to_thread(submit.check_turbo_support)
+    except submit.NoWorkersAvailable:
+        turbo_issues = None
+        log.info("TURBO_PREFLIGHT_DEFERRED workers_offline=true preferences_preserved=true")
     except Exception as error:
         turbo_issues = [str(error)]
     if turbo_issues:
@@ -1127,9 +1130,13 @@ async def post_init(application):
         log.warning("GENERATION_MODE_FALLBACK mode=standard preferences_preserved=true")
     else:
         TURBO_UNAVAILABLE = False
-        log.info("TURBO_PREFLIGHT_OK lora=%s", submit.TURBO_LORA_NAME)
+        if turbo_issues is not None:
+            log.info("TURBO_PREFLIGHT_OK lora=%s", submit.TURBO_LORA_NAME)
     try:
         reference_issues = await asyncio.to_thread(submit.check_reference_support, accelerated=True)
+    except submit.NoWorkersAvailable:
+        reference_issues = None
+        log.info("REFERENCE_TURBO_PREFLIGHT_DEFERRED workers_offline=true preferences_preserved=true")
     except Exception as error:
         reference_issues = [str(error)]
     REFERENCE_TURBO_UNAVAILABLE = bool(reference_issues)
