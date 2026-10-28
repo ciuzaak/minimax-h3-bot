@@ -63,6 +63,18 @@ class RecipeTest(unittest.TestCase):
         self.assertEqual(graph["2"]["inputs"]["unet_name"], jobs.REFERENCE_MODEL_NAME)
         self.assertEqual(graph["6"]["class_type"], "MiniMaxH3ReferenceToVideo")
 
+    def test_submission_records_effective_recipe_in_worker_history(self):
+        graph, meta = self.build(turbo_backend="native", steps=50)
+        with patch.object(jobs, "build_prompt", return_value=(graph, meta)), \
+             patch.object(jobs, "select_server", return_value="http://worker"), \
+             patch.object(jobs, "check_job_support", return_value=[]), \
+             patch.object(jobs, "request_json", return_value={"prompt_id": "test"}) as request:
+            record = jobs.submit_job({"steps": 50}, 1)
+        sent = request.call_args.args[1]["extra_data"]["minimax_h3_recipe"]
+        self.assertEqual(sent["steps"], 8)
+        self.assertEqual(sent["lora"], NATIVE_TURBO_LORA_NAME)
+        self.assertEqual(record["sampler"], sent["sampler"])
+
     def test_preflight_does_not_treat_legacy_lora_as_native(self):
         def request(url, **kwargs):
             return [jobs.TURBO_LORA_NAME] if url.endswith("/loras") else {url.rsplit("/", 1)[1]: {}}

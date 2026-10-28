@@ -352,6 +352,10 @@ def check_turbo_support(servers=None, backend=None):
     issues = verify_asset("native-turbo", MODEL_DIR, COMFY_DIR) if backend == "native" else []
     for server in servers:
         try:
+            if backend == "native":
+                version = request_json(f"{server}/system_stats", timeout=3).get("system", {}).get("comfyui_version", "")
+                if not worker_version_at_least(version, (0, 31, 0)):
+                    issues.append(f"{server} 768p Turbo 需要 ComfyUI v0.31.0+")
             for node_type in node_types:
                 info = request_json(f"{server}/object_info/{node_type}", timeout=3)
                 if node_type not in info:
@@ -372,6 +376,10 @@ def check_reference_support(servers=None, accelerated=False, backend=None):
     issues = verify_asset("native-reference-turbo", MODEL_DIR, COMFY_DIR) if accelerated and backend == "native" else []
     for server in list(servers or check_servers()):
         try:
+            if accelerated and backend == "native":
+                version = request_json(f"{server}/system_stats", timeout=3).get("system", {}).get("comfyui_version", "")
+                if not worker_version_at_least(version, (0, 31, 0)):
+                    issues.append(f"{server} Ref2VA 768p Turbo 需要 ComfyUI v0.31.0+")
             info = request_json(f"{server}/object_info/MiniMaxH3ReferenceToVideo", timeout=3)
             if "MiniMaxH3ReferenceToVideo" not in info:
                 issues.append(f"{server} 缺少多图参考节点")
@@ -394,6 +402,11 @@ def check_reference_support(servers=None, accelerated=False, backend=None):
     return issues
 
 
+def worker_version_at_least(version, minimum):
+    match = re.match(r"^(\d+)\.(\d+)\.(\d+)", version)
+    return match is not None and tuple(map(int, match.groups())) >= minimum
+
+
 def check_video_vae_support(server, video_vae):
     """Fail before enqueueing an INT8 VAE on an old or incomplete worker."""
     if video_vae == "fp16":
@@ -404,8 +417,7 @@ def check_video_vae_support(server, video_vae):
     try:
         stats = request_json(f"{server}/system_stats", timeout=3)
         version = stats.get("system", {}).get("comfyui_version", "")
-        match = re.match(r"^(\d+)\.(\d+)\.(\d+)", version)
-        if match is None or tuple(map(int, match.groups())) < (0, 36, 0):
+        if not worker_version_at_least(version, (0, 36, 0)):
             return [f"{server} INT8 video VAE 需要 ComfyUI v0.36.0+，当前版本：{version or '未知'}"]
         models = request_json(f"{server}/models/vae", timeout=3)
         if VIDEO_VAES[video_vae] not in models:
@@ -424,8 +436,7 @@ def check_job_support(server, prompt, metadata):
     version = stats.get("system", {}).get("comfyui_version", "")
     metadata["comfyui_version"] = version
     if metadata["turbo_backend"] == "native":
-        match = re.match(r"^(\d+)\.(\d+)\.(\d+)", version)
-        if match is None or tuple(map(int, match.groups())) < (0, 31, 0):
+        if not worker_version_at_least(version, (0, 31, 0)):
             issues.append(f"{server} 768p Turbo 需要 ComfyUI v0.31.0+，当前版本：{version or '未知'}")
     for node_type in sorted({node["class_type"] for node in prompt.values()}):
         info = request_json(f"{server}/object_info/{node_type}", timeout=3)
@@ -454,7 +465,8 @@ def submit_job(job, index):
     if issues:
         raise RuntimeError("所选配方不可用：" + "；".join(issues))
     submitted_at_ms = round(time.time() * 1000)
-    response = request_json(f"{server}/prompt", {"prompt": prompt, "client_id": str(uuid.uuid4()), "extra_data": {"minimax_h3_job": job}})
+    response = request_json(f"{server}/prompt", {"prompt": prompt, "client_id": str(uuid.uuid4()),
+                            "extra_data": {"minimax_h3_job": job, "minimax_h3_recipe": metadata}})
     if "prompt_id" not in response:
         raise RuntimeError(f"Submission rejected by {server}: {response}")
     return {
