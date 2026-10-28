@@ -21,7 +21,7 @@ class GenerationSettings:
     reference_mode: str = "standard"
 
     def __post_init__(self):
-        if self.mode not in ("fast", "standard"):
+        if self.mode not in ("fast", "standard", "trial8") or (self.mode == "trial8" and self.input_mode != "reference"):
             raise ValueError("Unsupported generation mode")
         if type(self.seconds) is not int or self.seconds not in DURATIONS:
             raise ValueError("Unsupported duration")
@@ -29,7 +29,7 @@ class GenerationSettings:
             raise ValueError("Unsupported dialogue language")
         if self.input_mode not in ("i2v", "reference"):
             raise ValueError("Unsupported input mode")
-        if self.reference_mode not in ("fast", "standard"):
+        if self.reference_mode not in ("fast", "standard", "trial8"):
             raise ValueError("Unsupported reference mode")
 
 
@@ -44,7 +44,7 @@ def normalize_settings(data, default: GenerationSettings) -> GenerationSettings:
         seconds=seconds if type(seconds) is int and seconds in DURATIONS else default.seconds,
         dialogue_language=language if language in LANGUAGES else default.dialogue_language,
         input_mode=data.get("input_mode") if data.get("input_mode") in ("i2v", "reference") else default.input_mode,
-        reference_mode=data.get("reference_mode") if data.get("reference_mode") in ("fast", "standard") else default.reference_mode,
+        reference_mode=data.get("reference_mode") if data.get("reference_mode") in ("fast", "standard", "trial8") else default.reference_mode,
     )
 
 

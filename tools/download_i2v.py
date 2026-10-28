@@ -1,5 +1,6 @@
 from hashlib import sha256
 import os
+from pathlib import Path
 
 from modelscope import snapshot_download
 

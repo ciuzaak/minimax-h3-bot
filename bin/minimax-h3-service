@@ -2,7 +2,9 @@
 set -euo pipefail
 
 PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
-ENV_FILE="${MINIMAX_ENV_FILE:-$PROJECT_DIR/.env}"
+ENV_FILE="$(realpath -m "${MINIMAX_ENV_FILE:-$PROJECT_DIR/.env}")"
+CALLER_BOT_TOKEN_SET="${TG_BOT_TOKEN+x}"
+CALLER_BOT_TOKEN="${TG_BOT_TOKEN-}"
 if [ -f "$ENV_FILE" ]; then
     set -a
     # shellcheck disable=SC1090
@@ -10,12 +12,19 @@ if [ -f "$ENV_FILE" ]; then
     set +a
 fi
 BOT_ENV_FILE="${MINIMAX_BOT_ENV_FILE:-}"
+[ -z "$BOT_ENV_FILE" ] || BOT_ENV_FILE="$(realpath -m "$BOT_ENV_FILE")"
 if [ -n "$BOT_ENV_FILE" ] && [ "$BOT_ENV_FILE" != "$ENV_FILE" ] && [ -f "$BOT_ENV_FILE" ]; then
     set -a
     # shellcheck disable=SC1090
     . "$BOT_ENV_FILE"
     set +a
 fi
+
+# Explicit caller token has the same precedence as config.load_env.
+if [ "$CALLER_BOT_TOKEN_SET" = x ]; then
+    export TG_BOT_TOKEN="$CALLER_BOT_TOKEN"
+fi
+unset CALLER_BOT_TOKEN_SET CALLER_BOT_TOKEN
 
 : "${COMFY_DIR:=$PROJECT_DIR/../ComfyUI}"
 : "${COMFY_PYTHON:=python3}"
@@ -277,21 +286,8 @@ start_service() {
                 echo "MiniMax H3 service is ready on GPU(s) ${SELECTED_GPUS[*]}; Telegram bot disabled."
                 return
             fi
-            bot_command="cd '$PROJECT_DIR' && set -a && [ ! -f '$ENV_FILE' ] || . '$ENV_FILE'; [ -z '$BOT_ENV_FILE' ] || [ ! -f '$BOT_ENV_FILE' ] || . '$BOT_ENV_FILE'; set +a; PYTHONPATH='$PROJECT_DIR' '$BOT_PYTHON' -m '$BOT_MODULE' 2>&1 | tee '$LOG_DIR/minimax-h3-telegram-bot.log'"
-            tmux new-window -d -t "$SESSION" -n "bot" "$bot_command"
-            sleep 2
-            if ! tmux list-windows -t "$SESSION" -F '#W' | grep -qx 'bot'; then
-                echo "Telegram bot failed to start. Check $LOG_DIR/minimax-h3-telegram-bot.log" >&2
-                exit 1
-            fi
-            bot_state="connecting in background"
-            for bot_attempt in $(seq 1 15); do
-                if grep -q 'BOT_READY' "$LOG_DIR/minimax-h3-telegram-bot.log" 2>/dev/null; then
-                    bot_state="connected"
-                    break
-                fi
-                sleep 1
-            done
+            start_bot
+            bot_state="started"
             echo "MiniMax H3 service is ready on GPU(s) ${SELECTED_GPUS[*]}; Telegram bot $bot_state."
             return
         fi
@@ -300,6 +296,36 @@ start_service() {
 
     echo "Service startup timed out. Check $LOG_DIR/minimax-h3-service-gpu*.log" >&2
     exit 1
+}
+
+start_bot() {
+    [ "$MINIMAX_ENABLE_TELEGRAM" = "1" ] || { echo "Telegram bot disabled."; return; }
+    command -v "$BOT_PYTHON" >/dev/null 2>&1 && [ -n "${TG_BOT_TOKEN:-}" ] || { echo "Telegram bot needs BOT_PYTHON and TG_BOT_TOKEN." >&2; return 1; }
+    if tmux list-windows -t "$SESSION" -F '#W' 2>/dev/null | grep -qx bot; then
+        echo "Telegram bot window already exists."
+        return
+    fi
+    mkdir -p "$LOG_DIR" "$PROJECT_DIR/.runtime"
+    : > "$LOG_DIR/minimax-h3-telegram-bot.log"
+    local token_file
+    token_file="$(mktemp "$PROJECT_DIR/.runtime/bot-token.XXXXXXXX")"
+    chmod 600 "$token_file"
+    printf 'export TG_BOT_TOKEN=%q\nexport TG_ALLOWLIST=%q\n' "$TG_BOT_TOKEN" "${TG_ALLOWLIST:-}" > "$token_file"
+    local launch
+    if tmux has-session -t "$SESSION" 2>/dev/null; then
+        launch=(new-window -d -t "$SESSION" -n bot)
+    else
+        launch=(new-session -d -s "$SESSION" -n bot)
+    fi
+    # tmux may inherit another bot's token. Pin credentials without placing them
+    # in process arguments or changing the tmux server/global environment.
+    if ! tmux "${launch[@]}" -e "MINIMAX_BOT_TOKEN_FILE=$token_file" \
+        -e "MINIMAX_ENV_FILE=$ENV_FILE" -e "MINIMAX_BOT_ENV_FILE=$BOT_ENV_FILE" \
+        "trap 'rm -f -- \"\$MINIMAX_BOT_TOKEN_FILE\"' EXIT; cd '$PROJECT_DIR' && set -a && { [ ! -f '$ENV_FILE' ] || . '$ENV_FILE'; } && { [ -z '$BOT_ENV_FILE' ] || [ ! -f '$BOT_ENV_FILE' ] || . '$BOT_ENV_FILE'; } && set +a && . \"\$MINIMAX_BOT_TOKEN_FILE\" && rm -f -- \"\$MINIMAX_BOT_TOKEN_FILE\" && unset MINIMAX_BOT_TOKEN_FILE && trap - EXIT && PYTHONPATH='$PROJECT_DIR' '$BOT_PYTHON' -m '$BOT_MODULE' 2>&1 | tee '$LOG_DIR/minimax-h3-telegram-bot.log'"; then
+        rm -f -- "$token_file"
+        return 1
+    fi
+    echo "Telegram bot started; GPU worker state unchanged."
 }
 
 stop_service() {
@@ -342,13 +368,14 @@ case "${1:-status}" in
     stop) stop_service ;;
     restart) stop_service; start_service "${2:-$DEFAULT_GPU_COUNT}" ;;
     status) status_service ;;
+    bot-start) start_bot ;;
     workers-start) start_workers "${2:-$DEFAULT_GPU_COUNT}" ;;
     workers-stop) stop_workers ;;
     workers-restart) restart_workers "${2:-$DEFAULT_GPU_COUNT}" ;;
     workers-status) status_workers ;;
     validate) validate_runtime; echo "MiniMax H3 runtime validation passed." ;;
     *)
-        echo "Usage: $0 {start [1-8]|stop|restart [1-8]|status|workers-start [1-8]|workers-stop|workers-restart [1-8]|workers-status|validate}" >&2
+        echo "Usage: $0 {start [1-8]|stop|restart [1-8]|status|bot-start|workers-start [1-8]|workers-stop|workers-restart [1-8]|workers-status|validate}" >&2
         exit 2
         ;;
 esac
