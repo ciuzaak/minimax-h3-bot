@@ -75,3 +75,19 @@ class UserSettingsHandlersTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(bot.generation_settings(1).mode, "standard")
         self.assertEqual(self.store.get(1).mode, "fast")
         self.assertEqual(bot.generation_settings(1).mode, "fast")
+
+    async def test_resolution_and_recipe_are_frozen_when_prompt_arrives(self):
+        self.store.update(1, resolution="native")
+        state = {"chat_id": 11, "user_id": 1, "image_path": "unused", "width": 1024, "height": 576}
+        with patch.object(bot, "ACTIVE_IMAGES", {(11, 1): state}), \
+             patch.object(bot, "acquire_image"), \
+             patch.object(bot.submit, "I2V_TURBO_BACKEND", "native"), \
+             patch.object(bot.submit, "VIDEO_VAE", "int8"), \
+             patch.object(bot, "send_text_with_retry", new_callable=AsyncMock):
+            await bot.on_prompt_text(self.update(), SimpleNamespace(bot=Mock()))
+        self.store.update(1, resolution="balanced")
+        pending = next(iter(bot.PENDING_COUNT.values()))
+        self.assertEqual((pending["width"], pending["height"]), (1344, 768))
+        self.assertEqual(pending["resolution"], "native")
+        self.assertEqual(pending["turbo_backend"], "native")
+        self.assertEqual(pending["video_vae"], "int8")

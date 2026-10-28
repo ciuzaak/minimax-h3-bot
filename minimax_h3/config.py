@@ -58,6 +58,15 @@ COMFY_PYTHON = env_executable("COMFY_PYTHON", sys.executable)
 MODELSCOPE_PYTHON = env_executable("MODELSCOPE_PYTHON", sys.executable)
 BASE_PORT = int(os.environ.get("MINIMAX_BASE_PORT", "8190"))
 MAX_GPU_COUNT = int(os.environ.get("MINIMAX_MAX_GPU_COUNT", "8"))
+I2V_TURBO_BACKEND = os.environ.get("MINIMAX_I2V_TURBO_BACKEND", "legacy")
+REFERENCE_TURBO_BACKEND = os.environ.get("MINIMAX_REFERENCE_TURBO_BACKEND", "legacy")
+VIDEO_VAE = os.environ.get("MINIMAX_VIDEO_VAE", "fp16")
+if I2V_TURBO_BACKEND not in ("legacy", "native", "disabled"):
+    raise ValueError("MINIMAX_I2V_TURBO_BACKEND must be legacy, native or disabled")
+if VIDEO_VAE not in ("fp16", "int8"):
+    raise ValueError("MINIMAX_VIDEO_VAE must be fp16 or int8")
+if REFERENCE_TURBO_BACKEND not in ("legacy", "native", "disabled"):
+    raise ValueError("MINIMAX_REFERENCE_TURBO_BACKEND must be legacy, native or disabled")
 
 
 def ensure_model_paths_config() -> Path:
@@ -69,6 +78,7 @@ def ensure_model_paths_config() -> Path:
         "  diffusion_models: diffusion_models\n"
         "  text_encoders: text_encoders\n"
         "  vae: vae\n"
+        "  loras: loras\n"
     )
     if not MODEL_PATHS_CONFIG.exists() or MODEL_PATHS_CONFIG.read_text(encoding="utf-8") != content:
         MODEL_PATHS_CONFIG.write_text(content, encoding="utf-8")

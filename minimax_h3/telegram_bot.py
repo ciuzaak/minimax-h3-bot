@@ -2,7 +2,6 @@
 import asyncio
 import json
 import logging
-import math
 import os
 import re
 import secrets
@@ -14,6 +13,7 @@ from pathlib import Path
 from .config import BASE_PORT, BOT_INPUT_DIR, LOG_DIR, PROJECT_DIR
 from .preferences import GenerationSettings, PreferenceStore
 from .input_sets import InputStore, collection_state, image_entries, image_paths
+from .profiles import resolution_for_size
 
 from telegram import BotCommand, BotCommandScopeAllPrivateChats, BotCommandScopeDefault, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Update
 from telegram.error import NetworkError, TimedOut
@@ -94,12 +94,15 @@ def generation_settings(user_id):
 
 def mode_label(mode="fast", task="i2v"):
     if task == "reference":
-        return "⚡ 多图参考 Fast（Ref2VA · 4 步）" if mode == "fast" else "多图参考（Ref2VA · 20 步）"
-    return "⚡ 单图首帧 Fast（Turbo LoRA · 8 步）" if mode == "fast" else "单图首帧（20 步）"
+        fast_label = "768p 试验 · 8 步" if submit.REFERENCE_TURBO_BACKEND == "native" else "Ref2VA · 4 步"
+        return f"⚡ 多图参考 Fast（{fast_label}）" if mode == "fast" else "多图参考（Ref2VA · 20 步）"
+    backend = "768p 试验 Turbo" if submit.I2V_TURBO_BACKEND == "native" else "Turbo LoRA"
+    return f"⚡ 单图首帧 Fast（{backend} · 8 步）" if mode == "fast" else "单图首帧（20 步）"
 
 
 def settings_label(settings):
-    return f"{mode_label(settings.mode, settings.input_mode)} · {settings.seconds} 秒 · 台词：{DIALOGUE_LANGUAGES[settings.dialogue_language]}"
+    resolution = "原生 768p" if settings.resolution == "native" else "均衡 576p"
+    return f"{mode_label(settings.mode, settings.input_mode)} · {settings.seconds} 秒 · {resolution} · 台词：{DIALOGUE_LANGUAGES[settings.dialogue_language]}"
 
 
 def dialogue_conversion_description(settings):
@@ -153,17 +156,8 @@ def user_key(update):
     return update.effective_chat.id, update.effective_user.id
 
 
-def resolution_for(width, height):
-    ratio = width / height
-    if ratio >= 1:
-        target_width, target_height = 576 * ratio, 576
-    else:
-        target_width, target_height = 576, 576 / ratio
-    if target_width * target_height > 576 * 1024:
-        scale = math.sqrt((576 * 1024) / (target_width * target_height))
-        target_width *= scale
-        target_height *= scale
-    return round(target_width / 32) * 32, round(target_height / 32) * 32
+def resolution_for(width, height, profile="balanced"):
+    return resolution_for_size(width, height, profile)
 
 
 def jpeg_dimensions(path):
@@ -216,7 +210,8 @@ def restore_private_chat_images():
             continue
         width, height = resolution_for(source_width, source_height)
         ACTIVE_IMAGES[(user_id, user_id)] = collection_state(user_id, user_id, (
-            {"image_path": str(image_path), "width": width, "height": height},))
+            {"image_path": str(image_path), "width": width, "height": height,
+             "source_width": source_width, "source_height": source_height},))
         restored += 1
     return restored
 
@@ -232,9 +227,10 @@ def count_keyboard(batch_key):
 
 
 def mode_keyboard(settings, user_id):
+    fast_steps = 4 if settings.input_mode == "reference" and submit.REFERENCE_TURBO_BACKEND != "native" else 8
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton(f"⚡ Fast（{4 if settings.input_mode == 'reference' else 8} 步）", callback_data=f"settings:{user_id}:mode:fast"),
+            InlineKeyboardButton(f"⚡ Fast（{fast_steps} 步）", callback_data=f"settings:{user_id}:mode:fast"),
             InlineKeyboardButton("原始模型（20 步）", callback_data=f"settings:{user_id}:mode:standard"),
         ],
         [
@@ -251,6 +247,10 @@ def mode_keyboard(settings, user_id):
         [
             InlineKeyboardButton(f"{'✓ ' if settings.input_mode == 'i2v' else ''}单图首帧", callback_data=f"settings:{user_id}:input_mode:i2v"),
             InlineKeyboardButton(f"{'✓ ' if settings.input_mode == 'reference' else ''}多图参考", callback_data=f"settings:{user_id}:input_mode:reference"),
+        ],
+        [
+            InlineKeyboardButton(f"{'✓ ' if settings.resolution == 'balanced' else ''}均衡 576p", callback_data=f"settings:{user_id}:resolution:balanced"),
+            InlineKeyboardButton(f"{'✓ ' if settings.resolution == 'native' else ''}原生 768p（较慢）", callback_data=f"settings:{user_id}:resolution:native"),
         ],
     ])
 
@@ -423,7 +423,8 @@ async def on_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     fields = {"mode": ("mode", {"fast", "standard"}), "seconds": ("seconds", {"5", "10", "15"}),
               "language": ("dialogue_language", set(DIALOGUE_LANGUAGES)),
-              "input_mode": ("input_mode", {"i2v", "reference"})}
+              "input_mode": ("input_mode", {"i2v", "reference"}),
+              "resolution": ("resolution", {"balanced", "native"})}
     if setting not in fields or value not in fields[setting][1]:
         await query.answer("无效的设置选项", show_alert=True)
         return
@@ -820,6 +821,7 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     return
                 await asyncio.sleep(2 ** attempt)
         batch["images"][message_id] = {"image_path": str(image_path), "width": width, "height": height,
+                                       "source_width": photo.width, "source_height": photo.height,
                                        "message_id": message_id}
         batch["messages"].append(update.message)
     except (OSError, ValueError):
@@ -878,6 +880,13 @@ async def on_prompt_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state["task"] = settings.input_mode
     state["accelerated"] = settings.mode == "fast"
     state["seconds"] = settings.seconds
+    first_image = image_entries(state)[0]
+    state["width"], state["height"] = resolution_for(
+        first_image.get("source_width", first_image["width"]),
+        first_image.get("source_height", first_image["height"]), settings.resolution)
+    state["resolution"] = settings.resolution
+    state["turbo_backend"] = submit.REFERENCE_TURBO_BACKEND if settings.input_mode == "reference" else submit.I2V_TURBO_BACKEND
+    state["video_vae"] = submit.VIDEO_VAE
     for path in paths:
         acquire_image(path)
     selected_mode = "fast" if state["accelerated"] else "standard"
@@ -934,6 +943,8 @@ def format_elapsed(seconds):
 async def deliver_video(application, chat_id, record, output_path):
     mode = mode_label("fast" if record.get("accelerated") else "standard", record.get("task", "i2v"))
     caption_lines = [f"完成 · {mode} · 视频 {record['actual_seconds']:.3f} 秒 · seed {record['seed']}"]
+    if all(key in record for key in ("width", "height", "steps", "video_vae")):
+        caption_lines.append(f"{record['width']}×{record['height']} · {record['steps']} 步 · VAE {record['video_vae'].upper()}")
     if record.get("render_seconds") is not None:
         timing = f"生成耗时 {format_elapsed(record['render_seconds'])}"
         if record.get("queue_seconds") is not None:
@@ -1002,9 +1013,12 @@ async def submit_batch(application, batch, seconds, count):
                         "width": batch["width"],
                         "height": batch["height"],
                         "task": batch.get("task", "i2v"),
+                        "resolution": batch.get("resolution", "balanced"),
+                        "video_vae": batch.get("video_vae", submit.VIDEO_VAE),
                     }
                     if job["task"] == "reference":
                         job["image_paths"] = list(image_paths(batch))
+                    job["turbo_backend"] = batch.get("turbo_backend", submit.REFERENCE_TURBO_BACKEND if job["task"] == "reference" else submit.I2V_TURBO_BACKEND)
                     record = await asyncio.to_thread(submit.submit_job, job, index)
                     record["prompt_text"] = batch.get("display_prompt", batch["prompt"])
                     records.append(record)

@@ -2,7 +2,6 @@
 import argparse
 import hashlib
 import json
-import math
 import re
 import secrets
 import shutil
@@ -15,7 +14,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
-from .config import BASE_PORT, COMFY_DIR, LOG_DIR, MAX_GPU_COUNT, OUTPUT_DIR
+from .config import BASE_PORT, COMFY_DIR, MODEL_DIR, I2V_TURBO_BACKEND, REFERENCE_TURBO_BACKEND, LOG_DIR, MAX_GPU_COUNT, OUTPUT_DIR, VIDEO_VAE
+from .assets import ASSETS, verify_asset
+from .profiles import (NATIVE_TURBO_LORA_NAME, NATIVE_REFERENCE_LORA_NAME, NATIVE_VIDEO_SHIFT,
+                       NATIVE_AUDIO_SHIFT, VIDEO_VAES, RESOLUTION_PROFILES, resolution_for_size)
 
 
 INPUT_DIR = COMFY_DIR / "input/minimax_h3_service"
@@ -69,6 +71,23 @@ def job_image_paths(job):
     return tuple(paths)
 
 
+def job_profile(job):
+    """Validate recipe choices before staging files or contacting a worker."""
+    reference = job.get("task") == "reference"
+    backend = job.get("turbo_backend", REFERENCE_TURBO_BACKEND if reference else I2V_TURBO_BACKEND)
+    if backend not in ("legacy", "native", "disabled"):
+        raise ValueError("turbo_backend must be legacy, native or disabled")
+    if backend == "disabled" and job.get("accelerated", False):
+        raise ValueError("Turbo is disabled; use standard mode or an explicit supported backend")
+    vae = job.get("video_vae", VIDEO_VAE)
+    if not isinstance(vae, str) or vae not in VIDEO_VAES:
+        raise ValueError("video_vae must be fp16 or int8")
+    resolution = job.get("resolution", "balanced")
+    if not isinstance(resolution, str) or resolution not in RESOLUTION_PROFILES:
+        raise ValueError("resolution must be balanced or native")
+    return backend, vae, resolution
+
+
 def load_jobs(path):
     jobs = []
     with path.open(encoding="utf-8") as stream:
@@ -111,13 +130,14 @@ def load_jobs(path):
             if not isinstance(job.get("accelerated", False), bool):
                 raise ValueError(f"Line {line_number}: accelerated must be true or false")
             job["accelerated"] = job.get("accelerated", False)
+            job_profile(job)
             jobs.append(job)
     if not jobs:
         raise ValueError("The JSONL file contains no jobs")
     return jobs
 
 
-def image_resolution(image_path, requested_width=None, requested_height=None):
+def image_resolution(image_path, requested_width=None, requested_height=None, profile="balanced"):
     if requested_width is not None or requested_height is not None:
         if requested_width is None or requested_height is None:
             raise ValueError("width and height must be provided together")
@@ -127,15 +147,7 @@ def image_resolution(image_path, requested_width=None, requested_height=None):
 
         with Image.open(image_path) as image:
             source_width, source_height = image.size
-        ratio = source_width / source_height
-        if ratio >= 1:
-            width, height = 576 * ratio, 576
-        else:
-            width, height = 576, 576 / ratio
-        if width * height > 576 * 1024:
-            scale = math.sqrt((576 * 1024) / (width * height))
-            width, height = width * scale, height * scale
-        width, height = round(width / 32) * 32, round(height / 32) * 32
+        width, height = resolution_for_size(source_width, source_height, profile)
     if width < 32 or height < 32 or width % 32 or height % 32:
         raise ValueError("width and height must be positive multiples of 32")
     return width, height
@@ -187,27 +199,35 @@ def enforce_no_background_music(prompt):
 
 def build_prompt(job, index):
     image_paths = job_image_paths(job)
+    backend, video_vae, resolution = job_profile(job)
     staged_images = [stage_image(path) for path in image_paths]
     reference = job.get("task") == "reference"
-    width, height = image_resolution(image_paths[0], job.get("width"), job.get("height"))
+    width, height = image_resolution(image_paths[0], job.get("width"), job.get("height"), resolution)
     length = frame_count(job["seconds"])
     prefix = output_prefix()
     conditioned_prompt = enforce_no_background_music(job["prompt"])
     accelerated = bool(job.get("accelerated", False))
-    steps = (REFERENCE_TURBO_STEPS if reference else TURBO_STEPS) if accelerated else int(job.get("steps", 20))
-    sampler = "minimax_h3_turbo" if accelerated and not reference else job.get("sampler", "res_multistep")
-    scheduler = "simple" if accelerated else job.get("scheduler", "simple")
-    model = ["16", 0] if accelerated else ["2", 0]
+    native_turbo = accelerated and backend == "native"
+    legacy_turbo = accelerated and not reference and backend == "legacy"
+    if native_turbo:
+        steps, sampler, scheduler = 8, "euler", "simple"
+    elif accelerated:
+        steps = REFERENCE_TURBO_STEPS if reference else TURBO_STEPS
+        sampler, scheduler = ("minimax_h3_turbo" if legacy_turbo else "res_multistep"), "simple"
+    else:
+        steps = int(job.get("steps", 20))
+        sampler, scheduler = job.get("sampler", "res_multistep"), job.get("scheduler", "simple")
+    model = ["30", 0] if native_turbo else ["16", 0] if accelerated else ["2", 0]
     prompt = {
         "1": {"class_type": "LoadImage", "inputs": {"image": staged_images[0]}},
         "2": {"class_type": "UNETLoader", "inputs": {"unet_name": REFERENCE_MODEL_NAME if reference else "minimax_h3_fl2va_pruned_int8_convrot.safetensors", "weight_dtype": "default"}},
         "3": {"class_type": "CLIPLoader", "inputs": {"clip_name": "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors", "type": "minimax", "device": "default"}},
-        "4": {"class_type": "VAELoader", "inputs": {"vae_name": "minimax_h3_video_vae_fp16.safetensors"}},
+        "4": {"class_type": "VAELoader", "inputs": {"vae_name": VIDEO_VAES[video_vae]}},
         "5": {"class_type": "VAELoader", "inputs": {"vae_name": "minimax_h3_audio_vae_fp32.safetensors"}},
         "6": {"class_type": "MiniMaxH3ImageToVideo", "inputs": {"clip": ["3", 0], "vae": ["4", 0], "prompt": conditioned_prompt, "width": width, "height": height, "length": length, "first_frame": ["1", 0]}},
         "7": {"class_type": "RandomNoise", "inputs": {"noise_seed": job["seed"]}},
         "8": {"class_type": "BasicGuider", "inputs": {"model": model, "conditioning": ["6", 0]}},
-        "9": {"class_type": "MiniMaxH3TurboSampler", "inputs": {}} if accelerated and not reference else {"class_type": "KSamplerSelect", "inputs": {"sampler_name": sampler}},
+        "9": {"class_type": "MiniMaxH3TurboSampler", "inputs": {}} if legacy_turbo else {"class_type": "KSamplerSelect", "inputs": {"sampler_name": sampler}},
         "10": {"class_type": "BasicScheduler", "inputs": {"model": model, "scheduler": scheduler, "steps": steps, "denoise": 1.0}},
         "11": {"class_type": "SamplerCustomAdvanced", "inputs": {"noise": ["7", 0], "guider": ["8", 0], "sampler": ["9", 0], "sigmas": ["10", 0], "latent_image": ["6", 1]}},
         "12": {"class_type": "VAEDecode", "inputs": {"samples": ["11", 0], "vae": ["4", 0]}},
@@ -229,9 +249,15 @@ def build_prompt(job, index):
             "class_type": "MiniMaxH3TurboLoRA",
             "inputs": {"model": ["2", 0], "lora_name": TURBO_LORA_NAME, "strength": 1.0, "low_vram": False},
         }
-        if reference:
+        if not legacy_turbo:
+            lora_name = NATIVE_REFERENCE_LORA_NAME if reference else NATIVE_TURBO_LORA_NAME
+            if not native_turbo:
+                lora_name = REFERENCE_TURBO_LORA_NAME
             prompt["16"] = {"class_type": "LoraLoaderModelOnly", "inputs": {
-                "model": ["2", 0], "lora_name": REFERENCE_TURBO_LORA_NAME, "strength_model": 1.0}}
+                "model": ["2", 0], "lora_name": lora_name, "strength_model": 1.0}}
+    if native_turbo:
+        prompt["30"] = {"class_type": "MiniMaxH3SigmaShift", "inputs": {
+            "model": ["16", 0], "shift_video": NATIVE_VIDEO_SHIFT, "shift_audio": NATIVE_AUDIO_SHIFT}}
     metadata = {
         "seed": job["seed"],
         "width": width,
@@ -245,6 +271,16 @@ def build_prompt(job, index):
         "scheduler": scheduler,
         "task": "reference" if reference else "i2v",
         "reference_count": len(image_paths) if reference else 0,
+        "turbo_backend": backend if accelerated else None,
+        "video_vae": video_vae,
+        "resolution": resolution,
+        "diffusion_model": prompt["2"]["inputs"]["unet_name"],
+        "lora": prompt["16"]["inputs"]["lora_name"] if accelerated else None,
+        "shift_video": NATIVE_VIDEO_SHIFT if native_turbo else 12.0,
+        "shift_audio": NATIVE_AUDIO_SHIFT if native_turbo else 3.0,
+        "experimental": native_turbo or video_vae == "int8",
+        "lora_sha256": ASSETS["native-reference-turbo" if reference else "native-turbo"][1] if native_turbo else None,
+        "video_vae_sha256": ASSETS["int8-vae"][1] if video_vae == "int8" else None,
     }
     return prompt, metadata
 
@@ -303,26 +339,37 @@ def check_servers():
     return available
 
 
-def check_turbo_support(servers=None):
+def check_turbo_support(servers=None, backend=None):
     """Return worker capability problems that would make Turbo jobs fail."""
     servers = list(servers or check_servers())
-    issues = []
+    backend = I2V_TURBO_BACKEND if backend is None else backend
+    if backend == "disabled":
+        return ["I2V Turbo 已禁用"]
+    if backend not in ("legacy", "native"):
+        return ["未知的 I2V Turbo backend"]
+    node_types = TURBO_NODE_TYPES if backend == "legacy" else ("LoraLoaderModelOnly", "KSamplerSelect", "MiniMaxH3SigmaShift")
+    lora_name = TURBO_LORA_NAME if backend == "legacy" else NATIVE_TURBO_LORA_NAME
+    issues = verify_asset("native-turbo", MODEL_DIR, COMFY_DIR) if backend == "native" else []
     for server in servers:
         try:
-            for node_type in TURBO_NODE_TYPES:
+            for node_type in node_types:
                 info = request_json(f"{server}/object_info/{node_type}", timeout=3)
                 if node_type not in info:
                     issues.append(f"{server} 缺少节点 {node_type}")
             loras = request_json(f"{server}/models/loras", timeout=3)
-            if TURBO_LORA_NAME not in loras:
-                issues.append(f"{server} 找不到 LoRA {TURBO_LORA_NAME}")
+            if lora_name not in loras:
+                issues.append(f"{server} 找不到 LoRA {lora_name}")
         except Exception as error:
             issues.append(f"{server} 预检失败：{error}")
     return issues
 
 
-def check_reference_support(servers=None, accelerated=False):
-    issues = []
+def check_reference_support(servers=None, accelerated=False, backend=None):
+    backend = REFERENCE_TURBO_BACKEND if backend is None else backend
+    if accelerated and backend not in ("legacy", "native"):
+        return ["Ref2VA Turbo 已禁用或 backend 无效"]
+    lora_name = NATIVE_REFERENCE_LORA_NAME if backend == "native" else REFERENCE_TURBO_LORA_NAME
+    issues = verify_asset("native-reference-turbo", MODEL_DIR, COMFY_DIR) if accelerated and backend == "native" else []
     for server in list(servers or check_servers()):
         try:
             info = request_json(f"{server}/object_info/MiniMaxH3ReferenceToVideo", timeout=3)
@@ -332,28 +379,80 @@ def check_reference_support(servers=None, accelerated=False):
             if REFERENCE_MODEL_NAME not in models:
                 issues.append(f"{server} 找不到 Ref2VA 模型")
             if accelerated:
+                if backend == "native":
+                    info = request_json(f"{server}/object_info/MiniMaxH3SigmaShift", timeout=3)
+                    if "MiniMaxH3SigmaShift" not in info:
+                        issues.append(f"{server} 缺少 Ref2VA 768p shift 节点")
                 info = request_json(f"{server}/object_info/LoraLoaderModelOnly", timeout=3)
                 if "LoraLoaderModelOnly" not in info:
                     issues.append(f"{server} 缺少 Ref2VA Turbo 加载节点")
                 loras = request_json(f"{server}/models/loras", timeout=3)
-                if REFERENCE_TURBO_LORA_NAME not in loras:
-                    issues.append(f"{server} 找不到 Ref2VA 4 步 LoRA")
+                if lora_name not in loras:
+                    issues.append(f"{server} 找不到 Ref2VA {'768p 8' if backend == 'native' else '4'} 步 LoRA {lora_name}")
         except Exception as error:
             issues.append(f"{server} Ref2VA 预检失败：{error}")
+    return issues
+
+
+def check_video_vae_support(server, video_vae):
+    """Fail before enqueueing an INT8 VAE on an old or incomplete worker."""
+    if video_vae == "fp16":
+        return []
+    issues = verify_asset("int8-vae", MODEL_DIR, COMFY_DIR)
+    if issues:
+        return issues
+    try:
+        stats = request_json(f"{server}/system_stats", timeout=3)
+        version = stats.get("system", {}).get("comfyui_version", "")
+        match = re.match(r"^(\d+)\.(\d+)\.(\d+)", version)
+        if match is None or tuple(map(int, match.groups())) < (0, 36, 0):
+            return [f"{server} INT8 video VAE 需要 ComfyUI v0.36.0+，当前版本：{version or '未知'}"]
+        models = request_json(f"{server}/models/vae", timeout=3)
+        if VIDEO_VAES[video_vae] not in models:
+            return [f"{server} 找不到 INT8 video VAE"]
+    except Exception as error:
+        return [f"{server} INT8 video VAE 预检失败：{error}"]
+    return []
+
+
+def check_job_support(server, prompt, metadata):
+    """Check the selected graph only; missing optional recipes cannot block it."""
+    issues = []
+    if metadata["turbo_backend"] == "native":
+        issues.extend(verify_asset("native-reference-turbo" if metadata["task"] == "reference" else "native-turbo", MODEL_DIR, COMFY_DIR))
+    stats = request_json(f"{server}/system_stats", timeout=3)
+    version = stats.get("system", {}).get("comfyui_version", "")
+    metadata["comfyui_version"] = version
+    if metadata["turbo_backend"] == "native":
+        match = re.match(r"^(\d+)\.(\d+)\.(\d+)", version)
+        if match is None or tuple(map(int, match.groups())) < (0, 31, 0):
+            issues.append(f"{server} 768p Turbo 需要 ComfyUI v0.31.0+，当前版本：{version or '未知'}")
+    for node_type in sorted({node["class_type"] for node in prompt.values()}):
+        info = request_json(f"{server}/object_info/{node_type}", timeout=3)
+        if node_type not in info:
+            issues.append(f"{server} 缺少所选配方节点 {node_type}")
+    required_models = {
+        "diffusion_models": [prompt["2"]["inputs"]["unet_name"]],
+        "text_encoders": [prompt["3"]["inputs"]["clip_name"]],
+        "vae": [prompt["4"]["inputs"]["vae_name"], prompt["5"]["inputs"]["vae_name"]],
+    }
+    if metadata["accelerated"]:
+        required_models["loras"] = [metadata["lora"]]
+    for folder, names in required_models.items():
+        available = request_json(f"{server}/models/{folder}", timeout=3)
+        issues.extend(f"{server} 找不到 {folder}/{name}" for name in names if name not in available)
     return issues
 
 
 def submit_job(job, index):
     prompt, metadata = build_prompt(job, index)
     server = select_server(SERVERS)
-    if job.get("task") == "reference":
-        issues = check_reference_support([server], job.get("accelerated", False))
-        if issues:
-            raise RuntimeError("多图参考不可用：" + "；".join(issues))
-    elif job.get("accelerated"):
-        turbo_issues = check_turbo_support([server])
-        if turbo_issues:
-            raise RuntimeError("Turbo 加速不可用：" + "；".join(turbo_issues))
+    vae_issues = check_video_vae_support(server, metadata["video_vae"])
+    if vae_issues:
+        raise RuntimeError("；".join(vae_issues))
+    issues = check_job_support(server, prompt, metadata)
+    if issues:
+        raise RuntimeError("所选配方不可用：" + "；".join(issues))
     submitted_at_ms = round(time.time() * 1000)
     response = request_json(f"{server}/prompt", {"prompt": prompt, "client_id": str(uuid.uuid4()), "extra_data": {"minimax_h3_job": job}})
     if "prompt_id" not in response:

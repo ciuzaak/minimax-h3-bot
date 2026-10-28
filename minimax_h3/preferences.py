@@ -19,6 +19,7 @@ class GenerationSettings:
     dialogue_language: str = "Chinese"
     input_mode: str = "i2v"
     reference_mode: str = "standard"
+    resolution: str = "balanced"
 
     def __post_init__(self):
         if self.mode not in ("fast", "standard"):
@@ -31,6 +32,8 @@ class GenerationSettings:
             raise ValueError("Unsupported input mode")
         if self.reference_mode not in ("fast", "standard"):
             raise ValueError("Unsupported reference mode")
+        if self.resolution not in ("balanced", "native"):
+            raise ValueError("Unsupported resolution")
 
 
 def normalize_settings(data, default: GenerationSettings) -> GenerationSettings:
@@ -45,6 +48,7 @@ def normalize_settings(data, default: GenerationSettings) -> GenerationSettings:
         dialogue_language=language if language in LANGUAGES else default.dialogue_language,
         input_mode=data.get("input_mode") if data.get("input_mode") in ("i2v", "reference") else default.input_mode,
         reference_mode=data.get("reference_mode") if data.get("reference_mode") in ("fast", "standard") else default.reference_mode,
+        resolution=data.get("resolution") if data.get("resolution") in ("balanced", "native") else default.resolution,
     )
 
 

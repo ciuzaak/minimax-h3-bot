@@ -13,6 +13,7 @@
 - 使用 `tmux` 管理 1–8 个独立 GPU worker
 - JSONL 批量提交，自动分辨率、随机 seed、队列调度和结果记录
 - 支持 MiniMax H3 Turbo LoRA（8 步）与标准模式（默认 20 步）
+- 可选 2026-10-20 LightX2V 768p v1.1 单图/多图 8 步配方、INT8 视频 VAE；默认保留现有方案
 - 可选 Telegram Bot：单图首帧或最多 9 张参考图、个人设置、选择时长和数量、查看进度及管理 worker
 - 提供组件验证和端到端 smoke test
 
@@ -37,11 +38,11 @@
 - Python 3.10 或更高版本
 - 足够的磁盘空间与显存；实际需求取决于模型精度、分辨率、时长和 ComfyUI 配置
 
-服务脚本会检查以下已知可用版本：
+服务脚本检查 ComfyUI 核心环境；Turbo 是可选能力，缺失时标准 worker 仍可启动：
 
-- ComfyUI 包含提交 `93cb5ed` 或更高版本
-- `ComfyUI-MiniMax-H3-Turbo` 包含提交 `55fee864dd7b2976b1c4ce3c3d5f7968f181409f`
-- Turbo LoRA 的 SHA-256 为 `5f3a626cd72c93a8b9318d6760c510bc5092d2ab13aaba1f932c5bab07a416d3`
+- ComfyUI 包含提交 `93cb5ed` 的音频修复，或版本为 v0.31.0+（支持浅克隆的版本检查）
+- 使用兼容单图 Fast 时，检查 `ComfyUI-MiniMax-H3-Turbo` 的提交 `55fee864dd7b2976b1c4ce3c3d5f7968f181409f` 和旧 LoRA 哈希
+- INT8 视频 VAE 需要 v0.36.0+；请求还会检查实际 worker 版本、节点与所选模型
 
 如果只想使用脚本中的下载或基础验证能力，可以按需跳过 Telegram Bot。当前多卡模式是“一卡一个 worker”，并不会把单个任务拆分到多张卡上。
 
@@ -189,6 +190,24 @@ MINIMAX_USE_SAGE_ATTENTION=1
 
 设为 `MINIMAX_USE_SAGE_ATTENTION=0` 可关闭 SageAttention 检查和启动参数。
 
+### 可选的 768p Turbo 与 INT8 视频 VAE
+
+这些选项需要显式启用，不改变现有默认。版本、来源、采样取舍与本机验证范围见 [2026-10 更新记录](docs/2026-10-updates.md)。不要直接在共享 ComfyUI 中拉取或安装新依赖，应先用独立环境验证。
+
+```bash
+# ModelScope 直连；只下所选文件，核验 SHA-256 后原子发布。
+# 已验证的现有文件直接复用；下载中断后的分片保留在模型目录 .downloads/ 下。
+python -m tools.download_upgrades native-turbo native-reference-turbo int8-vae
+```
+
+| 配置 | 默认 | 可选值与行为 |
+| --- | --- | --- |
+| `MINIMAX_I2V_TURBO_BACKEND` | `legacy` | `native`：FL2V 768p v1.1 8 步试验；`disabled`：禁用单图 Fast |
+| `MINIMAX_REFERENCE_TURBO_BACKEND` | `legacy` | `native`：Ref2V 768p v1.1 8 步试验；`disabled`：禁用多图 Fast |
+| `MINIMAX_VIDEO_VAE` | `fp16` | `int8`：使用校验后的 INT8 视频 VAE；音频 VAE 保持 FP32 |
+
+新权重放在 `MINIMAX_MODEL_DIR/loras/` 与 `vae/`，模型路径文件会暴露它们，无需写入共享 ComfyUI。所选新权重必须存在于这个模型根目录或 `COMFY_DIR/models/`；同名文件会全部核验，避免搜索路径中的坏文件遮蔽正确版本。哈希按文件 stat 缓存，文件变化后重新核验。缺少或损坏的可选 Turbo 不阻止标准 worker 启动，但对应 Turbo 请求会被拒绝，Bot 启动预检会保留用户偏好并暂退标准模式。
+
 ## 批量提交任务
 
 复制示例并将图片改为真实的绝对路径：
@@ -210,6 +229,19 @@ cp examples/jobs.example.jsonl jobs.jsonl
 - `steps`：标准模式默认 20
 - `accelerated`：`true` 使用 Turbo LoRA，固定 8 步
 - `sampler` / `scheduler`：可选的 ComfyUI 采样配置
+- `resolution`：`balanced`（默认）或 `native`；省略宽高时使用 576 或 768 短边及相应面积限制，显式宽高优先
+- `turbo_backend`：逐任务覆盖 `legacy` / `native`；仅在 `accelerated:true` 时应用加速配方
+- `video_vae`：逐任务覆盖 `fp16` / `int8`
+
+例如使用新版单图配方与原生画布：
+
+```json
+{"image_path":"/data/input/example.jpg","prompt":"The orange boat drifts to the right. Audio: gentle water ripples.","seconds":5,"seed":42,"accelerated":true,"turbo_backend":"native","video_vae":"int8","resolution":"native"}
+```
+
+`native` 是固定的 8 步、Euler、simple、video/audio shift 6/3 配方，分别使用 FL2V / Ref2V 的专用 v1.1 768p LoRA，不接受 `steps` / `sampler` / `scheduler` 将它改成其他加速器。作者最新文件发布早于配套版本表更新，6/3 来自作者的 768p 系列说明；因此这两条新配方标为试验，不声称是逐权重完整认证的默认配置。旧单图仍使用 Larry sampler 8 步，旧多图仍使用专用 4 步 LoRA + res_multistep。
+
+结果记录包含实际 diffusion model、LoRA、视频 VAE、步数、sampler/scheduler、shift、尺寸、worker 版本和新权重校验值，便于比较；画布显式指定时以实际宽高为准。
 
 多图参考任务使用独立的 Ref2VA 模型与有序 `image_paths` 列表：
 
@@ -254,6 +286,8 @@ Bot 使用 `/mode` 修改你自己的生成模式、时长（5、10 或 15 秒�
 5. 收到提示词时会固定该任务的全部图片、顺序、模式和时长；之后修改或清空参考图不会改变已经收到的提示词任务。输入集合保存在 `.runtime/bot_inputs.json`，重启后可恢复；该文件及图片均不进入 Git。
 
 多图初始使用标准 20 步，在 `/mode` 可单独选择 Fast 4 步。单图和多图的 Fast 偏好分开保存，切回单图时仍使用原先选择的模式。4 步更快，但可能更锐化、丢失部分参考细节或偏离场景指令，重要结果可切回 20 步复核。
+
+`/mode` 还提供“均衡 576p”和“原生 768p（较慢）”，各用户独立保存，旧设置默认均衡。收到提示词时固定画布、所选 backend 和 VAE，之后修改偏好不会改变等待数量选择或已提交的任务。768p 提高像素预算，也增加显存与耗时；极宽/高画面会按面积限制降低短边。新上传图片保存原始尺寸用于计算，旧图片集合按已保存的画布比例恢复。Bot 完成消息显示实际尺寸、步数和视频 VAE；Fast 的标签会区分所配置的兼容配方和新版试验配方。
 
 多图 Fast 使用 `minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors`，应放在 ComfyUI 的 `models/loras/` 根目录，或由额外模型路径配置暴露同名文件。先运行 `tools.download_ref2va` 和 `tools.download_reference_turbo` 准备权重。单图与多图的 Fast 预检和运行时回退相互独立；缺少多图 Turbo 时暂用标准 20 步，不覆盖保存的 Fast 偏好。没有 Ref2VA 模型时明确报错，不会悄悄改成单图生成。
 
@@ -312,7 +346,7 @@ CI 不自动部署或重启服务。模型与采样变更仍需单独验证实�
 服务只选择 `nvidia-smi` 中没有计算进程的 GPU，不会抢占现有任务。停止占用进程或减少启动数量后重试。
 
 **Turbo 预检失败**  
-核对自定义节点版本、LoRA 路径与哈希。标准批任务仍可通过普通 ComfyUI 实例执行，但当前 `bin/minimax-h3-service` 的 worker 配置包含 Turbo 运行时预检。
+核对所选配方对应的节点、LoRA 路径与哈希。缺少可选 Turbo 时标准 worker 仍可启动，不会为单图配方误用多图权重。
 
 ## 已知局限
 
@@ -321,7 +355,7 @@ CI 不自动部署或重启服务。模型与采样变更仍需单独验证实�
 - JSONL 提交器和 Telegram Bot 支持单图首帧 I2V 与 Ref2VA 图片参考；参考视频、参考音频和首尾帧入口尚未接入。
 - 相册在最后一个已知下载完成后等待约一秒再展示编号；极迟到的更新可能进入下一批。提交前请以最新预览确认图片集合。
 - 切回单图时，如果集合仍有多张图，提交会要求删除多余图片或切回多图，不会静默忽略图片。切换模式、上传图片时不自动提交生成。
-- `bin/minimax-h3-service` 会统一预检 Turbo 自定义节点和 LoRA，即使只计划提交标准模式任务也需要满足该运行时检查。
+- 新版 Turbo 的文档版本表尚未完整覆盖最新文件；接入保持试验状态，不能把上游或少量本机样例视为所有内容的质量保证。
 - Telegram Bot 尚不支持按用户设置配额或队列优先级。
 - worker 调度主要依据 ComfyUI 队列长度和当前任务进度，不会根据显存占用、预计生成耗时或任务尺寸做资源预测。
 
