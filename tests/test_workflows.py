@@ -55,3 +55,12 @@ class WorkflowRegressionTest(unittest.TestCase):
         self.assertEqual((inputs["width"], inputs["height"]), (768, 1024))
         self.assertEqual(inputs["length"], metadata["frames"])
         self.assertEqual(metadata["actual_seconds"], inputs["length"] / 24)
+
+    def test_auto_canvas_follows_exif_orientation_for_real_jpeg_input(self):
+        source = Path(self.temporary.name) / "phone.jpg"
+        exif = Image.Exif()
+        exif[274] = 6
+        Image.new("RGB", (1200, 800)).save(source, exif=exif)
+        self.assertEqual(jobs.image_resolution(source), (576, 864))
+        self.assertEqual(jobs.image_resolution(source, profile="native"), (768, 1152))
+        self.assertEqual(jobs.image_resolution(source, 1024, 576), (1024, 576))

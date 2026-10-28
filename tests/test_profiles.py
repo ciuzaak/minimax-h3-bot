@@ -94,7 +94,8 @@ class RecipeTest(unittest.TestCase):
         self.assertEqual(resolution_for_size(1920, 1080), (1024, 576))
         self.assertEqual(resolution_for_size(1920, 1080, "native"), (1344, 768))
         self.assertEqual(resolution_for_size(1080, 1920, "native"), (768, 1344))
-        self.assertEqual(resolution_for_size(1, 100000, "native")[0], 32)
+        with self.assertRaisesRegex(ValueError, "maximum canvas"):
+            resolution_for_size(1, 100000, "native")
 
     def test_old_preferences_keep_balanced_and_new_preference_survives_restart(self):
         with tempfile.TemporaryDirectory() as directory:

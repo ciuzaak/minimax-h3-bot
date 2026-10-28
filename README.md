@@ -229,7 +229,7 @@ cp examples/jobs.example.jsonl jobs.jsonl
 - `steps`：标准模式默认 20
 - `accelerated`：`true` 使用 Turbo LoRA，固定 8 步
 - `sampler` / `scheduler`：可选的 ComfyUI 采样配置
-- `resolution`：`balanced`（默认）或 `native`；省略宽高时使用 576 或 768 短边及相应面积限制，显式宽高优先
+- `resolution`：`balanced`（默认）或 `native`；省略宽高时按图片实际方向（含 EXIF 旋转）使用 576 或 768 短边及相应面积限制，显式宽高优先
 - `turbo_backend`：逐任务覆盖 `legacy` / `native`；仅在 `accelerated:true` 时应用加速配方
 - `video_vae`：逐任务覆盖 `fp16` / `int8`
 

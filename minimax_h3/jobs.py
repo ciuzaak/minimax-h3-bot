@@ -147,6 +147,9 @@ def image_resolution(image_path, requested_width=None, requested_height=None, pr
 
         with Image.open(image_path) as image:
             source_width, source_height = image.size
+            # Match ComfyUI LoadImage's EXIF transpose without decoding/rotating all pixels here.
+            if image.getexif().get(274) in (5, 6, 7, 8):
+                source_width, source_height = source_height, source_width
         width, height = resolution_for_size(source_width, source_height, profile)
     if width < 32 or height < 32 or width % 32 or height % 32:
         raise ValueError("width and height must be positive multiples of 32")

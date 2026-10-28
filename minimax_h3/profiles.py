@@ -23,4 +23,7 @@ def resolution_for_size(width, height, profile="balanced"):
         raise ValueError("source dimensions must be positive")
     short_edge, max_pixels = RESOLUTION_PROFILES[profile]
     scale = min(short_edge / min(width, height), math.sqrt(max_pixels / (width * height)))
-    return max(32, round(width * scale / 32) * 32), max(32, round(height * scale / 32) * 32)
+    canvas = max(32, round(width * scale / 32) * 32), max(32, round(height * scale / 32) * 32)
+    if max(canvas) > 16384:
+        raise ValueError("source aspect ratio exceeds H3's maximum canvas dimension")
+    return canvas
