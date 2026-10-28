@@ -51,4 +51,6 @@ JSONL使用 `task: reference` 和 `reference_mode: trial8`；显式档位优先�
 
 64项离线测试、Python编译、Shell语法与Git空白检查通过。离线回归覆盖三档实际图路由、JSONL兼容、逐用户持久化与冻结、缺/坏权重不伤旧档、版本/节点失败、EXIF方向、下载复用与失败保留。Bot启动用单次0600私有文件交接已解析凭据，覆盖共享tmux继承别的token、显式调用者优先及新session/新window两条行为。`bot-start`只启动Bot，不启动GPU。
 
-本PR不合并或部署。审阅与CI通过后，统筹合并并授权快进原clone、仅重启MiniMax Bot；GPU workers保留停止状态，Qwen不动。原完整实验PR已关闭，实验分支和本地媒体保留。
+更新前先备份配置、个人偏好及输入集合，确认Bot没有尚未提交或等待交付的任务，并检查worker队列。可仅更新和重启Bot：停止原Bot后运行 `bin/minimax-h3-service bot-start`，核对新进程的运行目录、版本、凭据来源及启动日志。该入口不会启动GPU；worker原有运行或停止状态由操作者保留，其他服务不随Bot更新重启。回滚时恢复旧代码和配置备份，再仅重启Bot。
+
+2026-10-28验证快照：原生产workers停止，实验worker已结束；完整实验分支与本地媒体保留供复核。
