@@ -15,7 +15,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
-from .config import BASE_PORT, COMFY_DIR, LOG_DIR, MAX_GPU_COUNT, OUTPUT_DIR
+from .config import BASE_PORT, COMFY_DIR, LOG_DIR, MAX_GPU_COUNT, MODEL_DIR, OUTPUT_DIR
+from . import reference_trial
 
 
 INPUT_DIR = COMFY_DIR / "input/minimax_h3_service"
@@ -111,6 +112,7 @@ def load_jobs(path):
             if not isinstance(job.get("accelerated", False), bool):
                 raise ValueError(f"Line {line_number}: accelerated must be true or false")
             job["accelerated"] = job.get("accelerated", False)
+            reference_trial.mode_for_job(job)
             jobs.append(job)
     if not jobs:
         raise ValueError("The JSONL file contains no jobs")
@@ -127,6 +129,8 @@ def image_resolution(image_path, requested_width=None, requested_height=None):
 
         with Image.open(image_path) as image:
             source_width, source_height = image.size
+            if image.getexif().get(274) in (5, 6, 7, 8):
+                source_width, source_height = source_height, source_width
         ratio = source_width / source_height
         if ratio >= 1:
             width, height = 576 * ratio, 576
@@ -187,17 +191,21 @@ def enforce_no_background_music(prompt):
 
 def build_prompt(job, index):
     image_paths = job_image_paths(job)
+    reference_mode = reference_trial.mode_for_job(job)
+    trial8 = reference_mode == "trial8"
     staged_images = [stage_image(path) for path in image_paths]
     reference = job.get("task") == "reference"
     width, height = image_resolution(image_paths[0], job.get("width"), job.get("height"))
     length = frame_count(job["seconds"])
     prefix = output_prefix()
     conditioned_prompt = enforce_no_background_music(job["prompt"])
-    accelerated = bool(job.get("accelerated", False))
+    accelerated = reference_mode != "standard" if reference else bool(job.get("accelerated", False))
     steps = (REFERENCE_TURBO_STEPS if reference else TURBO_STEPS) if accelerated else int(job.get("steps", 20))
     sampler = "minimax_h3_turbo" if accelerated and not reference else job.get("sampler", "res_multistep")
+    if trial8:
+        steps, sampler = 8, "euler"
     scheduler = "simple" if accelerated else job.get("scheduler", "simple")
-    model = ["16", 0] if accelerated else ["2", 0]
+    model = ["30", 0] if trial8 else ["16", 0] if accelerated else ["2", 0]
     prompt = {
         "1": {"class_type": "LoadImage", "inputs": {"image": staged_images[0]}},
         "2": {"class_type": "UNETLoader", "inputs": {"unet_name": REFERENCE_MODEL_NAME if reference else "minimax_h3_fl2va_pruned_int8_convrot.safetensors", "weight_dtype": "default"}},
@@ -231,7 +239,10 @@ def build_prompt(job, index):
         }
         if reference:
             prompt["16"] = {"class_type": "LoraLoaderModelOnly", "inputs": {
-                "model": ["2", 0], "lora_name": REFERENCE_TURBO_LORA_NAME, "strength_model": 1.0}}
+                "model": ["2", 0], "lora_name": reference_trial.LORA_NAME if trial8 else REFERENCE_TURBO_LORA_NAME, "strength_model": 1.0}}
+    if trial8:
+        prompt["30"] = {"class_type": "MiniMaxH3SigmaShift", "inputs": {
+            "model": ["16", 0], "shift_video": 6.0, "shift_audio": 3.0}}
     metadata = {
         "seed": job["seed"],
         "width": width,
@@ -245,6 +256,13 @@ def build_prompt(job, index):
         "scheduler": scheduler,
         "task": "reference" if reference else "i2v",
         "reference_count": len(image_paths) if reference else 0,
+        "reference_mode": reference_mode,
+        "diffusion_model": prompt["2"]["inputs"]["unet_name"],
+        "lora": prompt["16"]["inputs"]["lora_name"] if accelerated else None,
+        "video_shift": 6.0 if trial8 else 12.0,
+        "audio_shift": 3.0,
+        "experimental": trial8,
+        "lora_sha256": reference_trial.EXPECTED_HASH if trial8 else None,
     }
     return prompt, metadata
 
@@ -321,8 +339,13 @@ def check_turbo_support(servers=None):
     return issues
 
 
-def check_reference_support(servers=None, accelerated=False):
-    issues = []
+def check_reference_support(servers=None, accelerated=False, reference_mode=None):
+    trial8 = reference_mode == "trial8"
+    if reference_mode not in (None, "fast", "standard", "trial8"):
+        return ["未知的参考图档位"]
+    if reference_mode is not None:
+        accelerated = reference_mode != "standard"
+    issues = reference_trial.verify_weights(MODEL_DIR, COMFY_DIR) if trial8 else []
     for server in list(servers or check_servers()):
         try:
             info = request_json(f"{server}/object_info/MiniMaxH3ReferenceToVideo", timeout=3)
@@ -336,8 +359,11 @@ def check_reference_support(servers=None, accelerated=False):
                 if "LoraLoaderModelOnly" not in info:
                     issues.append(f"{server} 缺少 Ref2VA Turbo 加载节点")
                 loras = request_json(f"{server}/models/loras", timeout=3)
-                if REFERENCE_TURBO_LORA_NAME not in loras:
-                    issues.append(f"{server} 找不到 Ref2VA 4 步 LoRA")
+                lora = reference_trial.LORA_NAME if trial8 else REFERENCE_TURBO_LORA_NAME
+                if lora not in loras:
+                    issues.append(f"{server} 找不到 Ref2VA {8 if trial8 else 4} 步 LoRA")
+            if trial8:
+                issues.extend(reference_trial.check_worker(server, request_json))
         except Exception as error:
             issues.append(f"{server} Ref2VA 预检失败：{error}")
     return issues
@@ -347,7 +373,7 @@ def submit_job(job, index):
     prompt, metadata = build_prompt(job, index)
     server = select_server(SERVERS)
     if job.get("task") == "reference":
-        issues = check_reference_support([server], job.get("accelerated", False))
+        issues = check_reference_support([server], metadata["accelerated"], metadata["reference_mode"])
         if issues:
             raise RuntimeError("多图参考不可用：" + "；".join(issues))
     elif job.get("accelerated"):
@@ -355,7 +381,7 @@ def submit_job(job, index):
         if turbo_issues:
             raise RuntimeError("Turbo 加速不可用：" + "；".join(turbo_issues))
     submitted_at_ms = round(time.time() * 1000)
-    response = request_json(f"{server}/prompt", {"prompt": prompt, "client_id": str(uuid.uuid4()), "extra_data": {"minimax_h3_job": job}})
+    response = request_json(f"{server}/prompt", {"prompt": prompt, "client_id": str(uuid.uuid4()), "extra_data": {"minimax_h3_job": job, "minimax_h3_recipe": metadata}})
     if "prompt_id" not in response:
         raise RuntimeError(f"Submission rejected by {server}: {response}")
     return {

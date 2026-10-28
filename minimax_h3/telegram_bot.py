@@ -94,8 +94,16 @@ def generation_settings(user_id):
 
 def mode_label(mode="fast", task="i2v"):
     if task == "reference":
+        if mode == "trial8":
+            return "多图参考 8 步试用（较慢）"
         return "⚡ 多图参考 Fast（Ref2VA · 4 步）" if mode == "fast" else "多图参考（Ref2VA · 20 步）"
     return "⚡ 单图首帧 Fast（Turbo LoRA · 8 步）" if mode == "fast" else "单图首帧（20 步）"
+
+
+def batch_mode(batch):
+    if batch.get("task") == "reference":
+        return batch.get("reference_mode", "fast" if batch.get("accelerated") else "standard")
+    return "fast" if batch.get("accelerated") else "standard"
 
 
 def settings_label(settings):
@@ -232,7 +240,7 @@ def count_keyboard(batch_key):
 
 
 def mode_keyboard(settings, user_id):
-    return InlineKeyboardMarkup([
+    rows = [
         [
             InlineKeyboardButton(f"⚡ Fast（{4 if settings.input_mode == 'reference' else 8} 步）", callback_data=f"settings:{user_id}:mode:fast"),
             InlineKeyboardButton("原始模型（20 步）", callback_data=f"settings:{user_id}:mode:standard"),
@@ -252,7 +260,10 @@ def mode_keyboard(settings, user_id):
             InlineKeyboardButton(f"{'✓ ' if settings.input_mode == 'i2v' else ''}单图首帧", callback_data=f"settings:{user_id}:input_mode:i2v"),
             InlineKeyboardButton(f"{'✓ ' if settings.input_mode == 'reference' else ''}多图参考", callback_data=f"settings:{user_id}:input_mode:reference"),
         ],
-    ])
+    ]
+    if settings.input_mode == "reference":
+        rows.insert(1, [InlineKeyboardButton("8 步试用（较慢）", callback_data=f"settings:{user_id}:mode:trial8")])
+    return InlineKeyboardMarkup(rows)
 
 
 def service_gpu_keyboard(action, action_key):
@@ -421,7 +432,7 @@ async def on_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if owner != str(update.effective_user.id):
         await query.answer("这不是你的设置面板，请使用 /mode。", show_alert=True)
         return
-    fields = {"mode": ("mode", {"fast", "standard"}), "seconds": ("seconds", {"5", "10", "15"}),
+    fields = {"mode": ("mode", {"fast", "standard", "trial8"}), "seconds": ("seconds", {"5", "10", "15"}),
               "language": ("dialogue_language", set(DIALOGUE_LANGUAGES)),
               "input_mode": ("input_mode", {"i2v", "reference"})}
     if setting not in fields or value not in fields[setting][1]:
@@ -430,20 +441,29 @@ async def on_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if setting == "input_mode" and user_key(update) in UPLOAD_BATCHES:
         await query.answer("图片收集中，请等待编号预览后再切换模式。", show_alert=True)
         return
-    if setting == "mode" and value == "fast":
+    target_input_mode = PREFERENCES.get(update.effective_user.id).input_mode
+    if setting == "mode" and value == "trial8" and target_input_mode != "reference":
+        await query.answer("8 步试用仅用于多图参考", show_alert=True)
+        return
+    if setting == "mode" and value in ("fast", "trial8"):
         try:
-            reference = PREFERENCES.get(update.effective_user.id).input_mode == "reference"
+            reference = target_input_mode == "reference"
             check = submit.check_reference_support if reference else submit.check_turbo_support
-            turbo_issues = await asyncio.to_thread(check, accelerated=True) if reference else await asyncio.to_thread(check)
+            turbo_issues = (await asyncio.to_thread(check, accelerated=True, reference_mode="trial8") if value == "trial8"
+                            else await asyncio.to_thread(check, accelerated=True) if reference else await asyncio.to_thread(check))
         except Exception as error:
             turbo_issues = [str(error)]
         if turbo_issues:
-            await query.answer("Fast 组件当前不可用", show_alert=True)
-            await query.edit_message_text("无法切换到 Fast：\n" + "\n".join(turbo_issues))
+            label = "8 步试用" if value == "trial8" else "Fast"
+            await query.answer(f"{label}组件当前不可用", show_alert=True)
+            await query.edit_message_text(f"无法切换到{label}：\n" + "\n".join(turbo_issues))
             return
-        if reference:
+        if PREFERENCES.get(update.effective_user.id).input_mode != target_input_mode:
+            await query.answer("输入模式已改变，请重新打开 /mode", show_alert=True)
+            return
+        if reference and value == "fast":
             REFERENCE_TURBO_UNAVAILABLE = False
-        else:
+        elif not reference:
             TURBO_UNAVAILABLE = False
     field = fields[setting][0]
     if setting == "mode" and PREFERENCES.get(update.effective_user.id).input_mode == "reference":
@@ -876,11 +896,13 @@ async def on_prompt_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state["requested_count"] = requested_count
     state["image_paths"] = paths
     state["task"] = settings.input_mode
-    state["accelerated"] = settings.mode == "fast"
+    state["accelerated"] = settings.mode != "standard"
+    if settings.input_mode == "reference":
+        state["reference_mode"] = settings.mode
     state["seconds"] = settings.seconds
     for path in paths:
         acquire_image(path)
-    selected_mode = "fast" if state["accelerated"] else "standard"
+    selected_mode = batch_mode(state)
     if requested_count is not None:
         context.application.create_task(
             submit_batch(context.application, state, state["seconds"], requested_count)
@@ -932,7 +954,7 @@ def format_elapsed(seconds):
 
 
 async def deliver_video(application, chat_id, record, output_path):
-    mode = mode_label("fast" if record.get("accelerated") else "standard", record.get("task", "i2v"))
+    mode = mode_label(batch_mode(record), record.get("task", "i2v"))
     caption_lines = [f"完成 · {mode} · 视频 {record['actual_seconds']:.3f} 秒 · seed {record['seed']}"]
     if record.get("render_seconds") is not None:
         timing = f"生成耗时 {format_elapsed(record['render_seconds'])}"
@@ -1005,6 +1027,7 @@ async def submit_batch(application, batch, seconds, count):
                     }
                     if job["task"] == "reference":
                         job["image_paths"] = list(image_paths(batch))
+                        job["reference_mode"] = batch_mode(batch)
                     record = await asyncio.to_thread(submit.submit_job, job, index)
                     record["prompt_text"] = batch.get("display_prompt", batch["prompt"])
                     records.append(record)
@@ -1014,7 +1037,7 @@ async def submit_batch(application, batch, seconds, count):
 
         if not records:
             return
-        mode = mode_label("fast" if batch["accelerated"] else "standard", batch.get("task", "i2v"))
+        mode = mode_label(batch_mode(batch), batch.get("task", "i2v"))
         log.info(
             "BATCH_SUBMITTED count=%d seconds=%d accelerated=%s workers=%d",
             len(records),
@@ -1062,7 +1085,7 @@ async def on_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
     batch = PENDING_COUNT.pop(batch_key)
     count = int(count_text)
     context.application.create_task(submit_batch(context.application, batch, batch["seconds"], count))
-    selected_mode = "fast" if batch["accelerated"] else "standard"
+    selected_mode = batch_mode(batch)
     try:
         await query.answer(f"将生成 {count} 条")
         await query.edit_message_text(

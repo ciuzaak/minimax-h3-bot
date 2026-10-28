@@ -109,6 +109,9 @@ python -m tools.download_ref2va
 
 # 多图参考 Fast 的专用 4 步 LoRA（标准 20 步不需要）
 python -m tools.download_reference_turbo
+
+# 可选：只下载多图参考 8 步试用 LoRA，不改变默认或服务
+python -m tools.download_reference_trial
 ```
 
 下载脚本读取 `.env` 中的模型目录，完成后逐个校验文件哈希。可通过 `MODELSCOPE_DOWNLOAD_PARALLEL_WORKERS` 调整并行数。
@@ -217,9 +220,17 @@ cp examples/jobs.example.jsonl jobs.jsonl
 {"task":"reference","image_paths":["/data/input/person.jpg","/data/input/cat.jpg"],"prompt":"The person from <Picture 1> sits beside the cat from <Picture 2>. Static camera, quiet room ambience.","seconds":5,"seed":42,"accelerated":true}
 ```
 
-`task` 省略时保持单图 I2V 行为。`reference` 接受 1–9 张图片，`<Picture 1>` 对应列表第一张。标准模式默认 20 步；`accelerated:true` 使用专用 Ref2V 4 步 LoRA、原生 `LoraLoaderModelOnly` 与 `res_multistep`，不会使用单图的 Larry LoRA 或自定义 Turbo sampler。`ref_image_size` 可选 `match`（默认，按输出像素面积缩小参考图，较快）或 `max`（保留更多参考细节，可能明显变慢）。输出宽高省略时按第一张图确定，其他图片保持各自比例。
+`task` 省略时保持单图 I2V 行为。`reference` 接受 1–9 张图片，`<Picture 1>` 对应列表第一张。标准模式默认 20 步；`accelerated:true` 使用专用 Ref2V 4 步 LoRA、原生 `LoraLoaderModelOnly` 与 `res_multistep`，不会使用单图的 Larry LoRA 或自定义 Turbo sampler。`reference_mode` 可显式设为 `fast`、`trial8` 或 `standard`，优先于旧 `accelerated` 字段；省略时旧字段行为不变。`trial8` 固定专用 Ref2V v1.1 768p LoRA、8步/Euler/simple/shift6,3，标准模式仍允许 `steps` 自定义。`ref_image_size` 可选 `match`（默认，按输出像素面积缩小参考图，较快）或 `max`（保留更多参考细节，可能明显变慢）。输出宽高省略时按第一张图确定，其他图片保持各自比例。
 
 默认等待所有任务完成，并在输入文件旁写入 `*.results.jsonl`。使用 `--no-wait` 可在入队后立即返回，使用 `--results PATH` 可指定结果文件。
+
+例如只选择参考图8步，画布仍沿用原576算法或显式宽高：
+
+```json
+{"task":"reference","reference_mode":"trial8","image_paths":["/path/person.png","/path/cup.png"],"prompt":"参考图场景","seconds":5,"seed":42}
+```
+
+8步缺少权重/节点或校验失败会明确报错，不改变4步和20步；结果及worker历史记录实际LoRA、步数、sampler、shift和校验值。该档是LightX2V衍生试验配方，不是MiniMax官方新基础模型。来源、质量取舍及运行时验证见[Ref8试用说明](docs/ref8-trial.md)。
 
 ## Telegram Bot（可选）
 
@@ -241,7 +252,7 @@ MINIMAX_DEFAULT_DIALOGUE_LANGUAGE=Chinese
 
 `TG_ALLOWLIST` 是允许使用 Bot 的 Telegram 数字用户 ID，多个 ID 用逗号或空格分隔。首次不知道 ID 时，可先启动 Bot 后使用 `/id` 查看，再立即补好白名单并重启。不要将 Token 提交到 Git。
 
-Bot 使用 `/mode` 修改你自己的生成模式、时长（5、10 或 15 秒）和自动台词语言；`/language` 是同一设置面板的快捷入口。每位用户的偏好独立保存，并跨聊天生效；群聊中的设置按钮只允许打开面板的用户操作。语言可选中文、日语、韩语、英语或“无”，分别生成 `[Chinese]`、`[Japanese]`、`[Korean]`、`[English]` 标签；选择“无”时不转换或校验尖括号内容，方便手写多语言 `<d>[Language] ...</d>` 标签。设置会保存在被 Git 忽略的 `.runtime/bot_settings.json`，重启 Bot 后仍然有效。Fast 使用 Turbo LoRA 8 步，原始模型使用 20 步。模型、时长和台词语言在收到提示词时固定到该任务，不受之后的设置修改影响。
+Bot 使用 `/mode` 修改你自己的生成模式、时长（5、10 或 15 秒）和自动台词语言；`/language` 是同一设置面板的快捷入口。每位用户的偏好独立保存，并跨聊天生效；群聊中的设置按钮只允许打开面板的用户操作。语言可选中文、日语、韩语、英语或“无”，分别生成 `[Chinese]`、`[Japanese]`、`[Korean]`、`[English]` 标签；选择“无”时不转换或校验尖括号内容，方便手写多语言 `<d>[Language] ...</d>` 标签。设置会保存在被 Git 忽略的 `.runtime/bot_settings.json`，重启 Bot 后仍然有效。单图 Fast 使用原 Turbo LoRA 8 步；参考图提供原 Fast 4 步、新 8 步试用与标准 20 步。模型、时长和台词语言在收到提示词时固定到该任务，不受之后的设置修改影响。
 
 升级时，旧的共享设置作为所有用户的初始默认值保留；第一次修改偏好时，文件自动迁移为包含默认值和各用户偏好的版本 2 格式。升级前的设置按钮会提示重新打开 `/mode`。启动时若 Turbo 预检失败，会暂时按原始模型提交，不会覆盖保存的 Fast 偏好；组件恢复后重新选择 Fast 或重启 Bot 即可恢复。回退到旧版本前请备份设置文件，旧版本不支持各用户偏好格式。
 
@@ -253,7 +264,7 @@ Bot 使用 `/mode` 修改你自己的生成模式、时长（5、10 或 15 秒�
 4. 提示词写明每张图的用途。例如人物来自 `<Picture 1>`，猫来自 `<Picture 2>`。不要写 `<图1>` 或 `<Picture1>`，开启自动对白转换时它们会被当作台词。
 5. 收到提示词时会固定该任务的全部图片、顺序、模式和时长；之后修改或清空参考图不会改变已经收到的提示词任务。输入集合保存在 `.runtime/bot_inputs.json`，重启后可恢复；该文件及图片均不进入 Git。
 
-多图初始使用标准 20 步，在 `/mode` 可单独选择 Fast 4 步。单图和多图的 Fast 偏好分开保存，切回单图时仍使用原先选择的模式。4 步更快，但可能更锐化、丢失部分参考细节或偏离场景指令，重要结果可切回 20 步复核。
+多图初始使用标准 20 步，在 `/mode` 可分别选择 Fast 4 步、8 步试用（较慢）或标准 20 步。单图和多图的 Fast 偏好分开保存，切回单图时仍使用原先选择的模式。4 步更快，但可能丢失参考细节或偏离场景指令。8 步试用较慢，质量取舍随样例和画布变化；默认576对照还出现过头顶裁切，重要结果可切回20步复核。
 
 多图 Fast 使用 `minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors`，应放在 ComfyUI 的 `models/loras/` 根目录，或由额外模型路径配置暴露同名文件。先运行 `tools.download_ref2va` 和 `tools.download_reference_turbo` 准备权重。单图与多图的 Fast 预检和运行时回退相互独立；缺少多图 Turbo 时暂用标准 20 步，不覆盖保存的 Fast 偏好。没有 Ref2VA 模型时明确报错，不会悄悄改成单图生成。
 
@@ -331,3 +342,5 @@ CI 不自动部署或重启服务。模型与采样变更仍需单独验证实�
 - `.env`、运行日志、生成结果、Bot 临时文件和本地任务文件已被 `.gitignore` 排除。提交前仍建议运行 `git status`，确认没有误加入 Token、用户 ID、私人图片或本机路径。
 - 如果凭据曾经进入 Git 历史，仅删除当前文件并不安全；应先撤销并轮换凭据，再清理历史。安全问题的报告方式见 [SECURITY.md](SECURITY.md)。
 - 本仓库自行编写的代码采用 [MIT License](LICENSE)。MiniMax H3 权重、Turbo LoRA、ComfyUI、自定义节点及其他第三方依赖不包含在该授权范围内，仍分别遵循其原始许可证和使用条款。
+
+仅启动Bot而保持GPU workers状态，可运行 `bin/minimax-h3-service bot-start`；已存在Bot窗口时不会重复启动。凭据由解析配置后的单次私有文件传给tmux子进程，不写入命令参数或tmux全局环境。
