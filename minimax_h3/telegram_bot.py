@@ -12,7 +12,7 @@ from dataclasses import replace
 from contextlib import ExitStack
 from pathlib import Path
 
-from .config import BASE_PORT, BOT_INPUT_DIR, LOG_DIR, PROJECT_DIR
+from .config import BASE_PORT, BOT_INPUT_DIR, LOG_DIR, PROJECT_DIR, SHARED_WORKER
 from .preferences import GenerationSettings, PreferenceStore
 from .input_sets import InputStore, collection_state, image_entries, image_paths
 
@@ -370,7 +370,8 @@ def active_service_servers():
         servers = []
     try:
         submit.request_json(f"{image_jobs.SERVER}/system_stats", timeout=0.5)
-        servers.append(image_jobs.SERVER)
+        if image_jobs.SERVER not in servers:
+            servers.append(image_jobs.SERVER)
     except Exception:
         pass
     if not servers:
@@ -386,7 +387,7 @@ def service_progress_snapshot():
         pending = len(queue.get("queue_pending", []))
         snapshot.append({
             "server": server,
-            "gpu": "Image" if server == image_jobs.SERVER else int(server.rsplit(":", 1)[1]) - BASE_PORT,
+            "gpu": ("共享单卡" if SHARED_WORKER else "Image") if server == image_jobs.SERVER else int(server.rsplit(":", 1)[1]) - BASE_PORT,
             "running": running,
             "pending": pending,
             "percent": sampler_progress(server) if running else None,
@@ -625,21 +626,21 @@ async def request_service_gpu_count(update: Update, action):
 
 
 async def service_start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if generation_settings(update.effective_user.id).input_mode == "image":
+    if SHARED_WORKER or generation_settings(update.effective_user.id).input_mode == "image":
         await image_worker_control(update, "start")
         return
     await request_service_gpu_count(update, "start")
 
 
 async def service_restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if generation_settings(update.effective_user.id).input_mode == "image":
+    if SHARED_WORKER or generation_settings(update.effective_user.id).input_mode == "image":
         await image_worker_control(update, "restart")
         return
     await request_service_gpu_count(update, "restart")
 
 
 async def service_stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if generation_settings(update.effective_user.id).input_mode == "image":
+    if SHARED_WORKER or generation_settings(update.effective_user.id).input_mode == "image":
         await image_worker_control(update, "stop")
         return
     if not allowed(update.effective_user.id):
@@ -660,6 +661,9 @@ async def service_stop_command(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def on_service_gpu_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    if SHARED_WORKER:
+        await query.answer("当前图像和视频共用一张卡，请用 /service_start 或 /service_restart。", show_alert=True)
+        return
     _, action, action_key, count_text = query.data.split(":", 3)
     pending = PENDING_SERVICE_ACTIONS.get(action_key)
     if pending is None or pending["action"] != action:
@@ -1036,7 +1040,8 @@ async def image_worker_control(update, action):
         process = await asyncio.create_subprocess_exec(str(PROJECT_DIR / "bin/minimax-h3-image-service"), action,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
         output, _ = await process.communicate()
-    await update.message.reply_text(f"H3-Image 服务 {action} {'成功' if process.returncode == 0 else '失败'}\n" + output.decode("utf-8", "replace")[-2500:])
+    name = "图像／视频共享单卡服务" if SHARED_WORKER else "H3-Image 服务"
+    await update.message.reply_text(f"{name} {action} {'成功' if process.returncode == 0 else '失败'}\n" + output.decode("utf-8", "replace")[-2500:])
 
 
 async def image_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1321,9 +1326,9 @@ async def post_init(application):
         BotCommand("progress", "查看生成和排队进度"),
         BotCommand("id", "查看 Telegram ID"),
         BotCommand("cancel", "取消尚未提交的任务"),
-        BotCommand("service_start", "选择卡数并启动 GPU 服务"),
+        BotCommand("service_start", "启动共享单卡服务" if SHARED_WORKER else "选择卡数并启动 GPU 服务"),
         BotCommand("service_stop", "停止 GPU 服务并保持 Bot 在线"),
-        BotCommand("service_restart", "选择卡数并重启 GPU 服务"),
+        BotCommand("service_restart", "重启共享单卡服务" if SHARED_WORKER else "选择卡数并重启 GPU 服务"),
         BotCommand("stop", "危险：停止全部生成并清空队列"),
     ]
     for scope in (BotCommandScopeDefault(), BotCommandScopeAllPrivateChats()):

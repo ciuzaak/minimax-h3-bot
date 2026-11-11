@@ -15,6 +15,35 @@ W4A8 给激活值和参考图留出更多空间，BF16 文件约 40.23 GB，不�
 
 图像 worker 与原视频 worker 使用独立 ComfyUI checkout、Python 环境和端口，共享模型目录、输入目录及输出目录。图像 worker 默认自动选一张空闲 GPU，预留 3GB，开启 low-VRAM，使用 PyTorch SDPA；图像 VAE 使用模型内置的自适应解码。启动器同时检查实际显存占用，避免容器看不到宿主机 GPU 进程时误选忙卡。
 
+### 图像和视频共用一张卡
+
+设置 `MINIMAX_SHARED_WORKER=1` 后，图像、单图视频、多图参考视频均提交到图像 runtime 的同一端口、同一队列。只有一个 ComfyUI 进程，每次只执行一个任务，切换任务时由 ComfyUI 卸载/加载相应模型；切换模型会增加等待时间。默认 `0` 保留独立 worker 的部署方式。
+
+共享模式通过 `--base-directory "$COMFY_DIR"` 复用原视频模型目录和 `ComfyUI-MiniMax-H3-Turbo` 自定义节点，并只放行这个节点。需要先配置上述新版图像 runtime、原视频权重、VAE、Turbo 节点及 LoRA。仅启动两个独立 worker 并绑定同一 GPU 不属于这种模式，也不能保证显存足够。
+
+首次迁移时先在旧配置下执行 `bin/minimax-h3-service workers-stop` 停止独立视频 workers，再设置以下环境项，并重启图像 worker 和 Bot：
+
+```dotenv
+MINIMAX_SHARED_WORKER=1
+MINIMAX_IMAGE_GPU=0
+```
+
+```bash
+bin/minimax-h3-service restart 1
+```
+
+启用后，Bot 在所有模式下的 `/service_start`、`/service_stop`、`/service_restart` 都控制这个共享 worker，停止 worker 仍保留 Bot。命令行的 `start`、`restart`、`workers-start`、`workers-restart` 只接受 1 张卡；旧的多卡按钮会失效。`/progress` 和 `/stop` 只统计或操作共享队列一次。切换图像/视频模式无需手动启停服务。
+
+2026-11-11，GPU 0 单个共享进程连续实测，使用上述图像 runtime、3GB reserve 和 SDPA，未启动独立视频进程：
+
+| 顺序 | 任务 | 输出 | 执行耗时 | 显存采样最大值 |
+| --- | --- | --- | --- | --- |
+| 1 | 单图视频 Turbo，8 步 | 576×576，5.167 秒，H.264 + AAC 32kHz | 67.32 秒 | 21648 MiB |
+| 2 | 原生图像编辑，6 步 | 内部 4096×4096，交付 2048×2048 | 40.18 秒 | 21536 MiB |
+| 3 | 多图参考 Fast，4 步（1 张参考图） | 576×576，5.167 秒，H.264 + AAC 32kHz | 42.64 秒 | 22006 MiB |
+
+视频已检查音视频流及实际时长，编辑图已检查准确输出尺寸，记录在 `.runtime/shared-worker-smoke.json`。这验证了同卡顺序执行和模型切换；不代表所有时长、参考图数量、比例或画质均已验收。
+
 ## 参数档位
 
 所有档位固定 **Euler / simple / 6 步 / CFG 1 / denoise 1**，使用权重内置 PDD sigma 网格，无负向提示词，无视频 Turbo LoRA。
