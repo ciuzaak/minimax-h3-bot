@@ -7,6 +7,7 @@ import os
 import re
 import secrets
 import urllib.request
+from io import BytesIO
 from dataclasses import replace
 from contextlib import ExitStack
 from pathlib import Path
@@ -16,7 +17,7 @@ from .preferences import GenerationSettings, PreferenceStore
 from .input_sets import InputStore, collection_state, image_entries, image_paths
 
 from telegram import BotCommand, BotCommandScopeAllPrivateChats, BotCommandScopeDefault, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Update
-from telegram.error import NetworkError, TimedOut
+from telegram.error import BadRequest, NetworkError, TimedOut
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 from telegram.request import HTTPXRequest
 
@@ -26,6 +27,7 @@ TOKEN = os.environ.get("TG_BOT_TOKEN", "").strip()
 ALLOWLIST = {int(value) for value in os.environ.get("TG_ALLOWLIST", "").replace(",", " ").split() if value.isdigit()}
 
 from . import jobs as submit
+from . import image_jobs
 
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO)
@@ -84,6 +86,8 @@ REFERENCE_TURBO_UNAVAILABLE = False
 
 def generation_settings(user_id):
     settings = PREFERENCES.get(user_id)
+    if settings.input_mode == "image":
+        return settings
     if settings.input_mode == "reference":
         settings = replace(settings, mode=settings.reference_mode)
     unavailable = REFERENCE_TURBO_UNAVAILABLE if settings.input_mode == "reference" else TURBO_UNAVAILABLE
@@ -107,10 +111,16 @@ def batch_mode(batch):
 
 
 def settings_label(settings):
+    if settings.input_mode == "image":
+        width, height = image_jobs.canvas(settings.image_profile, settings.image_ratio)
+        edit = "编辑跟随图1尺寸" if settings.image_edit_size == "input" else "编辑使用自定义画布"
+        return f"H3-Image · {image_jobs.PROFILES[settings.image_profile][0]} · 文生图 {width}×{height} · {edit} · {settings.image_quant.upper()} · 6 步"
     return f"{mode_label(settings.mode, settings.input_mode)} · {settings.seconds} 秒 · 台词：{DIALOGUE_LANGUAGES[settings.dialogue_language]}"
 
 
 def dialogue_conversion_description(settings):
+    if settings.input_mode == "image":
+        return "直接发提示词文生图；上传参考图后发提示词编辑，用 <Picture 1> 等引用。编辑默认输出图1的尺寸与比例；档位控制生成质量，可选自定义画布。保留原始像素请将 PNG/JPEG/WebP 作为文件发送；照片模式以 Telegram 实际传来的尺寸为准。/images clear 恢复文生图。当前没有自动提示词扩写，请用完整英文描述成图及需保留的参考内容。"
     if settings.dialogue_language == "none":
         return "自动台词转换已关闭；尖括号内容会保持原样，适合手写多语言 H3 对白标签。"
     return f"每段 <台词> 会自动转换为 H3 {DIALOGUE_LANGUAGES[settings.dialogue_language]}对白格式。"
@@ -175,7 +185,7 @@ def resolution_for(width, height):
 
 
 def jpeg_dimensions(path):
-    """Read JPEG dimensions without adding Pillow to the lightweight bot environment."""
+    """Read JPEG dimensions directly from its frame header."""
     start_of_frame = {0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF}
     with Path(path).open("rb") as stream:
         if stream.read(2) != b"\xff\xd8":
@@ -229,10 +239,10 @@ def restore_private_chat_images():
     return restored
 
 
-def count_keyboard(batch_key):
+def count_keyboard(batch_key, unit="条"):
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton(f"{count} 条", callback_data=f"count:{batch_key}:{count}")
+            InlineKeyboardButton(f"{count} {unit}", callback_data=f"count:{batch_key}:{count}")
             for count in range(start, start + 4)
         ]
         for start in (1, 5)
@@ -240,6 +250,14 @@ def count_keyboard(batch_key):
 
 
 def mode_keyboard(settings, user_id):
+    if settings.input_mode == "image":
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"{'✓ ' if settings.image_profile == key else ''}{label}", callback_data=f"settings:{user_id}:image_profile:{key}") for key, (label, _) in image_jobs.PROFILES.items()],
+            [InlineKeyboardButton(f"{'✓ ' if settings.image_edit_size == key else ''}{label}", callback_data=f"settings:{user_id}:image_edit_size:{key}") for key, label in (("input", "编辑：跟随图1"), ("canvas", "编辑：自定义画布"))],
+            [InlineKeyboardButton(f"{'✓ ' if settings.image_ratio == key else ''}{key}", callback_data=f"settings:{user_id}:image_ratio:{key.replace(':', '-')}") for key in image_jobs.RATIOS],
+            [InlineKeyboardButton(f"{'✓ ' if settings.image_quant == key else ''}{key.upper()}", callback_data=f"settings:{user_id}:image_quant:{key}") for key in image_jobs.QUANTS],
+            [InlineKeyboardButton("切回单图视频", callback_data=f"settings:{user_id}:input_mode:i2v"), InlineKeyboardButton("切回参考视频", callback_data=f"settings:{user_id}:input_mode:reference")],
+        ])
     rows = [
         [
             InlineKeyboardButton(f"⚡ Fast（{4 if settings.input_mode == 'reference' else 8} 步）", callback_data=f"settings:{user_id}:mode:fast"),
@@ -259,6 +277,7 @@ def mode_keyboard(settings, user_id):
         [
             InlineKeyboardButton(f"{'✓ ' if settings.input_mode == 'i2v' else ''}单图首帧", callback_data=f"settings:{user_id}:input_mode:i2v"),
             InlineKeyboardButton(f"{'✓ ' if settings.input_mode == 'reference' else ''}多图参考", callback_data=f"settings:{user_id}:input_mode:reference"),
+            InlineKeyboardButton("H3-Image 生图／编辑", callback_data=f"settings:{user_id}:input_mode:image"),
         ],
     ]
     if settings.input_mode == "reference":
@@ -329,6 +348,8 @@ def sampler_progress(server):
     port = int(server.rsplit(":", 1)[1])
     gpu = port - BASE_PORT
     log_path = LOG_DIR / f"minimax-h3-service-gpu{gpu}.log"
+    if server == image_jobs.SERVER:
+        log_path = LOG_DIR / "minimax-h3-image.log"
     try:
         with log_path.open("rb") as stream:
             stream.seek(max(0, log_path.stat().st_size - 2 * 1024 * 1024))
@@ -342,15 +363,30 @@ def sampler_progress(server):
     return int(percentages[-1]) if percentages else None
 
 
+def active_service_servers():
+    try:
+        servers = submit.check_servers()
+    except submit.NoWorkersAvailable:
+        servers = []
+    try:
+        submit.request_json(f"{image_jobs.SERVER}/system_stats", timeout=0.5)
+        servers.append(image_jobs.SERVER)
+    except Exception:
+        pass
+    if not servers:
+        raise submit.NoWorkersAvailable("没有在线的图像或视频 worker")
+    return servers
+
+
 def service_progress_snapshot():
     snapshot = []
-    for server in submit.check_servers():
+    for server in active_service_servers():
         queue = submit.request_json(f"{server}/queue")
         running = len(queue.get("queue_running", []))
         pending = len(queue.get("queue_pending", []))
         snapshot.append({
             "server": server,
-            "gpu": int(server.rsplit(":", 1)[1]) - BASE_PORT,
+            "gpu": "Image" if server == image_jobs.SERVER else int(server.rsplit(":", 1)[1]) - BASE_PORT,
             "running": running,
             "pending": pending,
             "percent": sampler_progress(server) if running else None,
@@ -369,7 +405,7 @@ def post_empty_json(url, payload):
 def stop_all_service_jobs():
     stopped = []
     errors = []
-    for server in submit.check_servers():
+    for server in active_service_servers():
         try:
             queue = submit.request_json(f"{server}/queue")
             running = len(queue.get("queue_running", []))
@@ -387,7 +423,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     settings = generation_settings(update.effective_user.id)
     status = "你已在使用白名单中。" if allowed(update.effective_user.id) else f"你的 ID 是 {update.effective_user.id}，目前不在使用白名单中。"
     await update.message.reply_text(
-        "MiniMax H3 图生视频 Bot\n\n"
+        "MiniMax H3 图像／视频 Bot\n\n"
+        "图像：/image 切到 H3-Image，直接发提示词文生图；上传参考图后发提示词编辑。编辑默认保持图1尺寸，原始 PNG/JPEG/WebP 可作为文件上传。/mode 选择生成质量、比例、编辑尺寸与量化；/images clear 恢复文生图。\n\n"
         "1. 默认先发一张图片作为首帧；多图请先在 /mode 选择多图参考，再发送相册或逐张上传（最多 9 张）。\n"
         "2. 收到提醒后发送一个提示词；整条消息视为同一个提示词。\n"
         f"   {dialogue_conversion_description(settings)}\n"
@@ -434,7 +471,11 @@ async def on_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     fields = {"mode": ("mode", {"fast", "standard", "trial8"}), "seconds": ("seconds", {"5", "10", "15"}),
               "language": ("dialogue_language", set(DIALOGUE_LANGUAGES)),
-              "input_mode": ("input_mode", {"i2v", "reference"})}
+              "input_mode": ("input_mode", {"i2v", "reference", "image"}),
+              "image_profile": ("image_profile", set(image_jobs.PROFILES)),
+              "image_ratio": ("image_ratio", {key.replace(":", "-") for key in image_jobs.RATIOS}),
+              "image_edit_size": ("image_edit_size", {"input", "canvas"}),
+              "image_quant": ("image_quant", set(image_jobs.QUANTS))}
     if setting not in fields or value not in fields[setting][1]:
         await query.answer("无效的设置选项", show_alert=True)
         return
@@ -442,6 +483,9 @@ async def on_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("图片收集中，请等待编号预览后再切换模式。", show_alert=True)
         return
     target_input_mode = PREFERENCES.get(update.effective_user.id).input_mode
+    if setting == "mode" and target_input_mode == "image":
+        await query.answer("图像模型固定 6 步，请重新打开 /mode 选择图像档位。", show_alert=True)
+        return
     if setting == "mode" and value == "trial8" and target_input_mode != "reference":
         await query.answer("8 步试用仅用于多图参考", show_alert=True)
         return
@@ -468,6 +512,7 @@ async def on_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     field = fields[setting][0]
     if setting == "mode" and PREFERENCES.get(update.effective_user.id).input_mode == "reference":
         field = "reference_mode"
+    value = value.replace("-", ":") if setting == "image_ratio" else value
     PREFERENCES.update(update.effective_user.id, **{field: int(value) if setting == "seconds" else value})
     settings = generation_settings(update.effective_user.id)
     await query.answer("你的设置已修改")
@@ -580,14 +625,23 @@ async def request_service_gpu_count(update: Update, action):
 
 
 async def service_start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if generation_settings(update.effective_user.id).input_mode == "image":
+        await image_worker_control(update, "start")
+        return
     await request_service_gpu_count(update, "start")
 
 
 async def service_restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if generation_settings(update.effective_user.id).input_mode == "image":
+        await image_worker_control(update, "restart")
+        return
     await request_service_gpu_count(update, "restart")
 
 
 async def service_stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if generation_settings(update.effective_user.id).input_mode == "image":
+        await image_worker_control(update, "stop")
+        return
     if not allowed(update.effective_user.id):
         await update.message.reply_text("你不在使用白名单中。")
         return
@@ -667,20 +721,41 @@ async def show_images(context, key, state):
         acquire_image(path)
     try:
         with ExitStack() as stack:
-            media = [InputMediaPhoto(stack.enter_context(open(path, "rb")),
-                                     caption=f"🔒 <Picture {index + 1}>（点击查看）", has_spoiler=True)
-                     for index, path in enumerate(paths)]
+            media = []
+            for index, (path, entry) in enumerate(zip(paths, image_entries(state))):
+                if entry.get("original_file"):
+                    from PIL import Image, ImageOps
+                    preview = stack.enter_context(BytesIO())
+                    with Image.open(path) as source:
+                        thumb = ImageOps.exif_transpose(source).convert("RGB")
+                        thumb.thumbnail((1280, 1280))
+                        thumb.save(preview, format="JPEG", quality=85)
+                    preview.seek(0)
+                else:
+                    preview = stack.enter_context(open(path, "rb"))
+                media.append(InputMediaPhoto(preview, caption=f"🔒 <Picture {index + 1}>（点击查看）", has_spoiler=True))
             if len(media) == 1:
                 await context.bot.send_photo(key[0], photo=media[0].media,
                                              caption=media[0].caption, has_spoiler=True)
             else:
-                await context.bot.send_media_group(key[0], media=media)
+                for start in range(0, len(media), 10):
+                    group = media[start:start + 10]
+                    if len(group) == 1:
+                        await context.bot.send_photo(key[0], photo=group[0].media, caption=group[0].caption, has_spoiler=True)
+                    else:
+                        await context.bot.send_media_group(key[0], media=group)
         settings = generation_settings(key[1])
         text = (f"当前 {len(paths)} 张图片 · {settings_label(settings)}\n"
                 f"画布 {state['width']}×{state['height']}，按图 1 比例确定；更换图 1 会改变画布比例。\n"
                 "编号按上方预览顺序对应。用 <Picture 1>、<Picture 2> 明确各图用途；不要写 <图1>。\n"
                 "多图参考会追加新图片，最多 9 张；单图首帧会用新图片替换。用下方按钮删除、上移或清空。\n"
                 "请发送提示词；整条消息作为一个任务，背景音乐关闭。")
+        if settings.input_mode == "image":
+            source_width, source_height = image_jobs.source_size(paths[0])
+            text = (f"当前 {len(paths)} 张参考图 · {settings_label(settings)}\n"
+                    f"图1文件尺寸 {source_width}×{source_height}。\n"
+                    "用 <Picture 1>、<Picture 2> 指定参考图用途。最多 16 张；新图片会追加。\n"
+                    "请描述修改要求与完整成图；/images clear 清空后文生图。")
         await send_text_with_retry(context.bot, key[0], text, reply_markup=images_keyboard(state))
     except (OSError, NetworkError, TimedOut):
         log.warning("Could not show input previews")
@@ -772,8 +847,9 @@ async def flush_uploads(context, key, batch):
             images = images[-1:]
         elif key in ACTIVE_IMAGES:
             images = list(image_entries(ACTIVE_IMAGES[key])) + images
-        if len(images) > submit.MAX_REFERENCE_IMAGES:
-            await send_text_with_retry(context.bot, key[0], "最多支持 9 张参考图；这批图片未加入，请用 /images 删除或清空后重发。")
+        limit = image_jobs.MAX_IMAGES if batch["input_mode"] == "image" else submit.MAX_REFERENCE_IMAGES
+        if len(images) > limit:
+            await send_text_with_retry(context.bot, key[0], f"最多支持 {limit} 张参考图；这批图片未加入，请用 /images 删除或清空后重发。")
             return
         state = replace_collection(key, images)
         batch["committed"] = set(image_paths(state))
@@ -807,6 +883,21 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("你不在使用白名单中。")
         return
     key = user_key(update)
+    document = getattr(update.message, "document", None)
+    suffix = ".jpg"
+    if document is not None:
+        if PREFERENCES.get(key[1]).input_mode != "image":
+            await update.message.reply_text("请先使用 /image 切到图像模式，再发送原始图片文件。")
+            return
+        suffix = Path(document.file_name or "").suffix.lower()
+        if suffix not in {".jpg", ".jpeg", ".png", ".webp"}:
+            suffix = {"image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp"}.get(getattr(document, "mime_type", None), "")
+        if suffix not in {".jpg", ".jpeg", ".png", ".webp"}:
+            await update.message.reply_text("原图文件支持 PNG、JPEG 和 WebP。")
+            return
+        if document.file_size and document.file_size > 20 * 1024 * 1024:
+            await update.message.reply_text("这个文件超过 Telegram Bot 当前可下载的 20MB 上限，请提供较小的原图文件。")
+            return
     loop = asyncio.get_running_loop()
     message_id = update.message.message_id
     if key in ACTIVE_IMAGES and any(image.get("message_id") == message_id for image in image_entries(ACTIVE_IMAGES[key])):
@@ -824,14 +915,15 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     batch["pending"] += 1
     batch["album"] |= bool(update.message.media_group_id)
     batch["touched"] = loop.time()
-    image_path = BOT_INPUT_DIR / f"{key[1]}_{secrets.token_hex(8)}.jpg"
+    image_path = BOT_INPUT_DIR / f"{key[1]}_{secrets.token_hex(8)}{suffix}"
     try:
-        photo = update.message.photo[-1]
-        width, height = resolution_for(photo.width, photo.height)
+        media = document or update.message.photo[-1]
+        if document is None:
+            width, height = resolution_for(media.width, media.height)
         BOT_INPUT_DIR.mkdir(parents=True, exist_ok=True)
         for attempt in range(3):
             try:
-                telegram_file = await photo.get_file()
+                telegram_file = await media.get_file()
                 await telegram_file.download_to_drive(image_path)
                 break
             except (NetworkError, TimedOut):
@@ -839,10 +931,14 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await update.message.reply_text("图片下载超时，请稍后重新发送；这张图片未加入。")
                     return
                 await asyncio.sleep(2 ** attempt)
-        batch["images"][message_id] = {"image_path": str(image_path), "width": width, "height": height,
-                                       "message_id": message_id}
+        if document is not None:
+            width, height = resolution_for(*image_jobs.source_size(image_path))
+        entry = {"image_path": str(image_path), "width": width, "height": height, "message_id": message_id}
+        if document is not None:
+            entry["original_file"] = True
+        batch["images"][message_id] = entry
         batch["messages"].append(update.message)
-    except (OSError, ValueError):
+    except (OSError, ValueError, BadRequest):
         log.exception("Could not save incoming photo")
         await update.message.reply_text("图片保存失败；这张图片未加入，请重新发送。")
     finally:
@@ -862,12 +958,18 @@ async def on_prompt_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("图片收集中，请等待编号预览后再发送提示词。")
         return
     state = ACTIVE_IMAGES.get(key)
+    if settings.input_mode == "image":
+        await on_image_prompt(update, context, settings, state)
+        return
     if state is None:
         await update.message.reply_text("请先发送一张图片。")
         return
     paths = image_paths(state)
     if settings.input_mode == "i2v" and len(paths) != 1:
         await update.message.reply_text("单图首帧只能使用一张图。请在 /mode 切回多图参考，或用 /images 删除多余图片。")
+        return
+    if settings.input_mode == "reference" and len(paths) > submit.MAX_REFERENCE_IMAGES:
+        await update.message.reply_text("视频参考最多 9 张图；请先用 /images 删除多余图片，或切回 H3-Image。")
         return
 
     raw_prompt, requested_count = submit.extract_prompt_count(update.message.text)
@@ -924,6 +1026,111 @@ async def on_prompt_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         + f"当前使用 {mode_label(selected_mode, state['task'])} · {len(paths)} 张图 · {state['seconds']} 秒。请选择生成多少条视频：",
         reply_markup=count_keyboard(batch_key),
     )
+
+
+async def image_worker_control(update, action):
+    if not allowed(update.effective_user.id):
+        await update.message.reply_text("你不在使用白名单中。")
+        return
+    async with SUBMIT_LOCK:
+        process = await asyncio.create_subprocess_exec(str(PROJECT_DIR / "bin/minimax-h3-image-service"), action,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+        output, _ = await process.communicate()
+    await update.message.reply_text(f"H3-Image 服务 {action} {'成功' if process.returncode == 0 else '失败'}\n" + output.decode("utf-8", "replace")[-2500:])
+
+
+async def image_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update.effective_user.id):
+        await update.message.reply_text("你不在使用白名单中。")
+        return
+    if user_key(update) in UPLOAD_BATCHES:
+        await update.message.reply_text("图片收集中，请等待编号预览后再切换模式。")
+        return
+    PREFERENCES.update(update.effective_user.id, input_mode="image")
+    await mode_command(update, context)
+
+
+async def on_image_prompt(update, context, settings, state):
+    paths = image_paths(state) if state else ()
+    prompt, count = submit.extract_prompt_count(update.message.text)
+    batch = dict(chat_id=update.effective_chat.id, user_id=update.effective_user.id,
+                 task="image", image_paths=paths, prompt=prompt, display_prompt=prompt,
+                 seconds=0, image_profile=settings.image_profile, image_ratio=settings.image_ratio,
+                 image_quant=settings.image_quant, image_edit_size=settings.image_edit_size)
+    try:
+        normalized = image_jobs.normalize_job(batch)
+    except (ValueError, TypeError, OSError) as error:
+        await update.message.reply_text(f"图像任务无效：{error}")
+        return
+    output_label = f"输出 {normalized['width']}×{normalized['height']}"
+    for path in paths:
+        acquire_image(path)
+    if count is not None:
+        context.application.create_task(submit_batch(context.application, batch, 0, count))
+        await update.message.reply_text(f"已收到 H3-Image 任务 · {output_label} · {settings_label(settings)} · {len(paths)} 张参考图 · 生成 {count} 张。")
+        return
+    key = secrets.token_hex(6)
+    PENDING_COUNT[key] = batch
+    await update.message.reply_text(f"H3-Image · {output_label} · {settings_label(settings)} · {len(paths)} 张参考图；请选择生成张数：",
+                                    reply_markup=count_keyboard(key, "张"))
+
+
+async def deliver_image(application, chat_id, record, output_path):
+    caption = (f"H3-Image · {record['width']}×{record['height']} · {record['image_quant'].upper()} · 6 步\n"
+               f"seed {record['seed']} · 生成 {format_elapsed(record.get('render_seconds', 0))} · 排队 {format_elapsed(record.get('queue_seconds', 0))}\n"
+               + record.get("prompt_text", record["prompt"]))[:1024]
+    # Documents preserve the original PNG; Telegram photos recompress and limit size.
+    for attempt in range(5):
+        try:
+            with open(output_path, "rb") as stream:
+                await application.bot.send_document(chat_id, document=stream, caption=caption,
+                    read_timeout=180, write_timeout=180, connect_timeout=30)
+            log.info("IMAGE_DELIVERED file=%s seed=%d", Path(output_path).name, record["seed"])
+            return
+        except (NetworkError, TimedOut):
+            if attempt == 4:
+                raise
+            await asyncio.sleep(2 ** attempt)
+
+
+async def submit_image_batch(application, batch, count):
+    records = []
+    try:
+        try:
+            async with SUBMIT_LOCK:
+                seeds = set()
+                while len(seeds) < count:
+                    seeds.add(secrets.randbelow(2 ** 64))
+                for index, seed in enumerate(seeds, 1):
+                    record = await asyncio.to_thread(image_jobs.submit_job, dict(batch, seed=seed), index)
+                    record["prompt_text"] = batch["display_prompt"]
+                    records.append(record)
+        except Exception as error:
+            log.exception("Image batch submission failed")
+            await send_text_with_retry(application.bot, batch["chat_id"], f"图像任务提交失败：{error}")
+        if not records:
+            return
+        await send_text_with_retry(application.bot, batch["chat_id"], f"已提交 {len(records)} 张 H3-Image 图像；完成后发送原始 PNG 文件。")
+        tasks = [asyncio.create_task(wait_for_job(record)) for record in records]
+        for task in asyncio.as_completed(tasks):
+            try:
+                record = await task
+            except Exception as error:
+                log.exception("Image polling failed")
+                await send_text_with_retry(application.bot, batch["chat_id"], f"图像任务状态查询失败：{error}；其他任务继续处理。")
+                continue
+            if record["status"] != "completed" or not record.get("outputs"):
+                await send_text_with_retry(application.bot, batch["chat_id"], f"图像生成失败，seed {record['seed']}；请降低分辨率或切换 W4A8 后重试。")
+                continue
+            for output in record["outputs"]:
+                try:
+                    await deliver_image(application, batch["chat_id"], record, output)
+                except Exception:
+                    log.exception("Image delivery failed; output preserved at %s", output)
+                    await send_text_with_retry(application.bot, batch["chat_id"], f"图像发送失败，seed {record['seed']}；原图已保留在服务器。")
+    finally:
+        for path in image_paths(batch):
+            release_image(path)
 
 
 async def send_text_with_retry(bot, chat_id, text, attempts=5, **kwargs):
@@ -1003,6 +1210,9 @@ async def wait_for_job(record):
 
 
 async def submit_batch(application, batch, seconds, count):
+    if batch.get("task") == "image":
+        await submit_image_batch(application, batch, count)
+        return
     chat_id = batch["chat_id"]
     records = []
     try:
@@ -1087,7 +1297,10 @@ async def on_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.application.create_task(submit_batch(context.application, batch, batch["seconds"], count))
     selected_mode = batch_mode(batch)
     try:
-        await query.answer(f"将生成 {count} 条")
+        await query.answer(f"将生成 {count} {'张' if batch.get('task') == 'image' else '条'}")
+        if batch.get("task") == "image":
+            await query.edit_message_text(f"已选择 H3-Image · 共 {count} 张；正在提交，每张使用不同随机 seed……")
+            return
         await query.edit_message_text(
             f"已选择 {batch['seconds']} 秒 · {mode_label(selected_mode, batch.get('task', 'i2v'))} · 共 {count} 条；"
             "正在提交，每条使用不同随机 seed……"
@@ -1102,6 +1315,7 @@ async def post_init(application):
     commands = [
         BotCommand("start", "使用说明"),
         BotCommand("mode", "修改你的模型、时长和台词语言"),
+        BotCommand("image", "H3-Image 文生图／参考图编辑与画质设置"),
         BotCommand("language", "修改自动台词语言"),
         BotCommand("images", "查看、排序或清空参考图片"),
         BotCommand("progress", "查看生成和排队进度"),
@@ -1158,6 +1372,7 @@ def main():
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", start_command))
     application.add_handler(CommandHandler("mode", mode_command))
+    application.add_handler(CommandHandler("image", image_command))
     application.add_handler(CommandHandler("language", mode_command))
     application.add_handler(CommandHandler("images", images_command))
     application.add_handler(CommandHandler("id", id_command))
@@ -1169,9 +1384,10 @@ def main():
     application.add_handler(CommandHandler("service_stop", service_stop_command))
     application.add_handler(CommandHandler("service_restart", service_restart_command))
     application.add_handler(MessageHandler(filters.PHOTO, on_photo))
+    application.add_handler(MessageHandler(filters.Document.ALL, on_photo))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_prompt_text))
-    application.add_handler(CallbackQueryHandler(on_mode, pattern=r"^settings:(?:[1-9][0-9]*:)?(mode:(fast|standard)|seconds:(5|10|15)|language:(Chinese|Japanese|Korean|English|none)|input_mode:(i2v|reference))$"))
-    application.add_handler(CallbackQueryHandler(on_images, pattern=r"^images:[1-9][0-9]*:[0-9a-f]{8}:(remove|up|clear):[0-8]$"))
+    application.add_handler(CallbackQueryHandler(on_mode, pattern=r"^settings:(?:[1-9][0-9]*:)?(mode:(fast|standard|trial8)|seconds:(5|10|15)|language:(Chinese|Japanese|Korean|English|none)|input_mode:(i2v|reference|image)|image_profile:(preview|balanced|native)|image_ratio:(1-1|4-3|3-4|16-9|9-16)|image_quant:(int8|w4a8)|image_edit_size:(input|canvas))$"))
+    application.add_handler(CallbackQueryHandler(on_images, pattern=r"^images:[1-9][0-9]*:[0-9a-f]{8}:(remove|up|clear):(?:[0-9]|1[0-5])$"))
     application.add_handler(CallbackQueryHandler(on_count, pattern=r"^count:[0-9a-f]+:[1-8]$"))
     application.add_handler(CallbackQueryHandler(on_service_gpu_count, pattern=r"^service:(start|restart):[0-9a-f]+:[1-8]$"))
     application.add_error_handler(on_error)

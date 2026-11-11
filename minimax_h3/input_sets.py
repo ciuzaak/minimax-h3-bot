@@ -5,7 +5,7 @@ from pathlib import Path
 import secrets
 import tempfile
 
-from .jobs import MAX_REFERENCE_IMAGES
+MAX_COLLECTION_IMAGES = 16
 
 
 def image_paths(state):
@@ -22,8 +22,8 @@ def image_entries(state):
 
 def collection_state(chat_id, user_id, images):
     images = tuple(dict(image) for image in images)
-    if not 1 <= len(images) <= MAX_REFERENCE_IMAGES:
-        raise ValueError("A collection needs 1–9 images")
+    if not 1 <= len(images) <= MAX_COLLECTION_IMAGES:
+        raise ValueError("A collection needs 1–16 images")
     return {"chat_id": chat_id, "user_id": user_id, "images": images,
             "image_paths": tuple(image["image_path"] for image in images),
             "image_path": images[0]["image_path"], "width": images[0]["width"],
@@ -61,7 +61,7 @@ class InputStore:
                 if type(user_id) is not int or user_id not in allowed_users or type(chat_id) is not int:
                     continue
                 images = image_entries(row)
-                if not 1 <= len(images) <= MAX_REFERENCE_IMAGES:
+                if not 1 <= len(images) <= MAX_COLLECTION_IMAGES:
                     continue
                 checked = []
                 for image in images:
