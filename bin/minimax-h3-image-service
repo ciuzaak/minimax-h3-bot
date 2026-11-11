@@ -16,6 +16,18 @@ fi
 : "${MINIMAX_MODEL_PATHS_CONFIG:=$PROJECT_DIR/.runtime/extra_model_paths.yaml}"
 : "${COMFY_DIR:=$PROJECT_DIR/../ComfyUI}"
 SESSION="${MINIMAX_IMAGE_SESSION:-minimax-h3-image}"
+if [ "${MINIMAX_MANAGED_POOLS:-0}" = 1 ]; then
+    pool_python="${BOT_PYTHON:-python3}"
+    export PYTHONPATH="$PROJECT_DIR${PYTHONPATH:+:$PYTHONPATH}"
+    case "${1:-status}" in
+        start) "$pool_python" -m minimax_h3.worker_pools set --image "${2:-1}" ;;
+        stop) "$pool_python" -m minimax_h3.worker_pools set --image 0 ;;
+        restart) "$pool_python" -m minimax_h3.worker_pools restart --role image ;;
+        status) "$pool_python" -m minimax_h3.worker_pools status ;;
+        *) echo "Usage: $0 {start [0-8]|stop|restart|status}" >&2; exit 2 ;;
+    esac
+    exit 0
+fi
 case "${1:-status}" in
     start)
         if [ "${MINIMAX_SHARED_WORKER:-0}" = 1 ]; then

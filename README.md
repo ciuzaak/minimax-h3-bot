@@ -17,6 +17,7 @@
 - 提供组件验证和端到端 smoke test
 - 原生 H3-Image 文生图与最多 16 张参考图编辑，复用视频文本编码器；提供 4/8/16MP 档位，详见 [图像模型配置](docs/image-model.md)
 - 可选 `MINIMAX_SHARED_WORKER=1`：图像与视频共用一张 GPU、一个队列，自动切换模型
+- 可选 [Bot GPU 分配](docs/gpu-pools.md)：`/gpu` 独立设置视频／图像各 0～8 张，默认 0/0，视频优先，已有任务完成后释放卡
 
 > 本项目是社区工具，不是 MiniMax 或 ComfyUI 的官方项目。模型权重受其原始许可证和使用条款约束。
 
