@@ -368,6 +368,30 @@ status_service() {
     fi
 }
 
+# A single ComfyUI queue loads/unloads image and video models on the same GPU.
+# Route every worker command here so stale Bot panels or CLI calls cannot add GPUs.
+if [ "${MINIMAX_SHARED_WORKER:-0}" = 1 ]; then
+    case "${1:-status}" in
+        start|restart|workers-start|workers-restart)
+            [ "${2:-1}" = 1 ] || { echo "Shared image/video mode supports exactly one GPU." >&2; exit 2; }
+            action=start
+            [[ "$1" == *restart ]] && action=restart
+            "$PROJECT_DIR/bin/minimax-h3-image-service" "$action"
+            if [[ "$1" != workers-* ]]; then
+                [ "$1" != restart ] || stop_service
+                start_bot
+            fi
+            exit 0 ;;
+        workers-stop) "$PROJECT_DIR/bin/minimax-h3-image-service" stop; exit 0 ;;
+        stop) "$PROJECT_DIR/bin/minimax-h3-image-service" stop; stop_service; exit 0 ;;
+        status|workers-status)
+            "$PROJECT_DIR/bin/minimax-h3-image-service" status >/dev/null
+            echo "Shared image/video worker: ready (one GPU)."
+            [ "${1:-status}" != status ] || status_service
+            exit 0 ;;
+    esac
+fi
+
 case "${1:-status}" in
     start) start_service "${2:-$DEFAULT_GPU_COUNT}" ;;
     stop) stop_service ;;

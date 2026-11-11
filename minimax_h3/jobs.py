@@ -15,7 +15,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
-from .config import BASE_PORT, COMFY_DIR, LOG_DIR, MAX_GPU_COUNT, MODEL_DIR, OUTPUT_DIR
+from .config import BASE_PORT, COMFY_DIR, IMAGE_SERVER, LOG_DIR, MAX_GPU_COUNT, MODEL_DIR, OUTPUT_DIR, SHARED_WORKER
 from . import reference_trial
 
 
@@ -272,6 +272,8 @@ def sampler_progress(server):
     port = int(server.rsplit(":", 1)[1])
     gpu = port - BASE_PORT
     log_path = LOG_DIR / f"minimax-h3-service-gpu{gpu}.log"
+    if SHARED_WORKER and server == IMAGE_SERVER:
+        log_path = LOG_DIR / "minimax-h3-image.log"
     try:
         with log_path.open("rb") as stream:
             stream.seek(max(0, log_path.stat().st_size - 2 * 1024 * 1024))
@@ -311,13 +313,15 @@ class NoWorkersAvailable(RuntimeError):
 
 def check_servers():
     available = []
-    for server in POSSIBLE_SERVERS:
+    for server in ([IMAGE_SERVER] if SHARED_WORKER else POSSIBLE_SERVERS):
         try:
             request_json(f"{server}/system_stats", timeout=0.5)
         except Exception:
             continue
         available.append(server)
     if not available:
+        if SHARED_WORKER:
+            raise NoWorkersAvailable(f"Shared image/video worker is offline: {IMAGE_SERVER}")
         raise NoWorkersAvailable(
             f"No MiniMax H3 service endpoints are available on ports "
             f"{BASE_PORT}-{BASE_PORT + MAX_GPU_COUNT - 1}"

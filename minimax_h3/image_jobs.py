@@ -4,7 +4,6 @@ import argparse
 from datetime import datetime
 import json
 import math
-import os
 from pathlib import Path
 import re
 import secrets
@@ -12,9 +11,9 @@ import sys
 import uuid
 
 from . import jobs
+from .config import IMAGE_SERVER
 
-PORT = int(os.environ.get("MINIMAX_IMAGE_PORT", "8290"))
-SERVER = f"http://127.0.0.1:{PORT}"
+SERVER = IMAGE_SERVER
 QUANTS = {
     "int8": "minimax_h3_image_pruned_int8_convrot.safetensors",
     "w4a8": "minimax_h3_image_pruned_w4a8.safetensors",

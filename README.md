@@ -16,6 +16,7 @@
 - 可选 Telegram Bot：单图首帧或最多 9 张参考图、个人设置、选择时长和数量、查看进度及管理 worker
 - 提供组件验证和端到端 smoke test
 - 原生 H3-Image 文生图与最多 16 张参考图编辑，复用视频文本编码器；提供 4/8/16MP 档位，详见 [图像模型配置](docs/image-model.md)
+- 可选 `MINIMAX_SHARED_WORKER=1`：图像与视频共用一张 GPU、一个队列，自动切换模型
 
 > 本项目是社区工具，不是 MiniMax 或 ComfyUI 的官方项目。模型权重受其原始许可证和使用条款约束。
 

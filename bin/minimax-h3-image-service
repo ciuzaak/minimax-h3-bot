@@ -18,7 +18,17 @@ fi
 SESSION="${MINIMAX_IMAGE_SESSION:-minimax-h3-image}"
 case "${1:-status}" in
     start)
+        if [ "${MINIMAX_SHARED_WORKER:-0}" = 1 ]; then
+            legacy_workers=$(tmux list-windows -t "=${MINIMAX_TMUX_SESSION:-minimax-h3-service}" -F '#W' 2>/dev/null | grep -E '^gpu[0-9]+$' || true)
+            [ -z "$legacy_workers" ] || { echo "Stop legacy video workers before enabling the shared single-GPU worker." >&2; exit 1; }
+        fi
         if tmux has-session -t "=$SESSION" 2>/dev/null; then
+            if [ "${MINIMAX_SHARED_WORKER:-0}" = 1 ]; then
+                if ! curl -fsS "http://127.0.0.1:$MINIMAX_IMAGE_PORT/object_info/MiniMaxH3TurboLoRA" | "$MINIMAX_IMAGE_PYTHON" -c 'import json,sys; sys.exit(0 if "MiniMaxH3TurboLoRA" in json.load(sys.stdin) else 1)'; then
+                    echo "Existing worker lacks video Turbo support; restart it to apply shared mode." >&2
+                    exit 1
+                fi
+            fi
             echo "Image worker already running."
             exit 0
         fi
@@ -39,6 +49,10 @@ case "${1:-status}" in
             --input-directory "$COMFY_DIR/input" --output-directory "$MINIMAX_OUTPUT_DIR"
             --extra-model-paths-config "$MINIMAX_MODEL_PATHS_CONFIG"
             --disable-auto-launch --disable-all-custom-nodes --database-url 'sqlite:///:memory:')
+        if [ "${MINIMAX_SHARED_WORKER:-0}" = 1 ]; then
+            [ -f "$COMFY_DIR/custom_nodes/ComfyUI-MiniMax-H3-Turbo/__init__.py" ] || { echo "Shared worker requires the video Turbo custom node." >&2; exit 1; }
+            command+=(--base-directory "$COMFY_DIR" --whitelist-custom-nodes ComfyUI-MiniMax-H3-Turbo)
+        fi
         printf -v launch '%q ' "${command[@]}"
         printf -v logfile '%q' "$MINIMAX_LOG_DIR/minimax-h3-image.log"
         tmux new-session -d -s "$SESSION" -n image "exec $launch > $logfile 2>&1"
@@ -56,7 +70,17 @@ case "${1:-status}" in
         exit 1
         ;;
     stop) if tmux has-session -t "=$SESSION" 2>/dev/null; then tmux kill-session -t "=$SESSION"; fi ;;
-    restart) "$0" stop; "$0" start ;;
+    restart)
+        previous_gpu=$(tmux show-environment -t "=$SESSION" MINIMAX_IMAGE_GPU 2>/dev/null | sed -n 's/^MINIMAX_IMAGE_GPU=//p' || true)
+        "$0" stop
+        if [[ "$previous_gpu" =~ ^[0-9]+$ ]]; then
+            for attempt in $(seq 1 20); do
+                usage=$(nvidia-smi -i "$previous_gpu" --query-gpu=memory.used --format=csv,noheader,nounits)
+                [ "$usage" -ge 512 ] || break
+                sleep 1
+            done
+        fi
+        "$0" start ;;
     status) curl -fsS "http://127.0.0.1:$MINIMAX_IMAGE_PORT/system_stats" ;;
     *) echo "Usage: $0 {start|stop|restart|status}" >&2; exit 2 ;;
 esac
