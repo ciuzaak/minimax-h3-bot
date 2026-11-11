@@ -12,7 +12,7 @@ from dataclasses import replace
 from contextlib import ExitStack
 from pathlib import Path
 
-from .config import BASE_PORT, BOT_INPUT_DIR, LOG_DIR, PROJECT_DIR, SHARED_WORKER
+from .config import BASE_PORT, BOT_INPUT_DIR, LOG_DIR, MANAGED_POOLS, PROJECT_DIR, SHARED_WORKER
 from .preferences import GenerationSettings, PreferenceStore
 from .input_sets import InputStore, collection_state, image_entries, image_paths
 
@@ -28,6 +28,7 @@ ALLOWLIST = {int(value) for value in os.environ.get("TG_ALLOWLIST", "").replace(
 
 from . import jobs as submit
 from . import image_jobs
+from . import pool_bot, worker_pools
 
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO)
@@ -345,6 +346,8 @@ def discard_pending(predicate):
 
 def sampler_progress(server):
     """Read the latest sampler percentage from the worker's tqdm log output."""
+    if MANAGED_POOLS:
+        return submit.sampler_progress(server)
     port = int(server.rsplit(":", 1)[1])
     gpu = port - BASE_PORT
     log_path = LOG_DIR / f"minimax-h3-service-gpu{gpu}.log"
@@ -364,6 +367,9 @@ def sampler_progress(server):
 
 
 def active_service_servers():
+    if MANAGED_POOLS:
+        return list(dict.fromkeys(worker_pools.servers("video", include_draining=True)
+                                  + worker_pools.servers("image", include_draining=True)))
     try:
         servers = submit.check_servers()
     except submit.NoWorkersAvailable:
@@ -392,6 +398,10 @@ def service_progress_snapshot():
             "pending": pending,
             "percent": sampler_progress(server) if running else None,
         })
+        if MANAGED_POOLS:
+            worker = next((w for w in worker_pools.read_state()["workers"] if w["server"] == server), None)
+            if worker:
+                snapshot[-1]["gpu"] = f"{worker['gpu']}（{'视频' if worker['role'] == 'video' else '图像'}）"
     return snapshot
 
 
@@ -425,6 +435,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status = "你已在使用白名单中。" if allowed(update.effective_user.id) else f"你的 ID 是 {update.effective_user.id}，目前不在使用白名单中。"
     await update.message.reply_text(
         "MiniMax H3 图像／视频 Bot\n\n"
+        + ("GPU：/gpu 分别分配视频／图像卡数，均支持 0，首次默认 0/0；视频优先，已有任务完成后释放卡。\n\n" if MANAGED_POOLS else "") +
         "图像：/image 切到 H3-Image，直接发提示词文生图；上传参考图后发提示词编辑。编辑默认保持图1尺寸，原始 PNG/JPEG/WebP 可作为文件上传。/mode 选择生成质量、比例、编辑尺寸与量化；/images clear 恢复文生图。\n\n"
         "1. 默认先发一张图片作为首帧；多图请先在 /mode 选择多图参考，再发送相册或逐张上传（最多 9 张）。\n"
         "2. 收到提醒后发送一个提示词；整条消息视为同一个提示词。\n"
@@ -626,6 +637,9 @@ async def request_service_gpu_count(update: Update, action):
 
 
 async def service_start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if MANAGED_POOLS:
+        await pool_bot.gpu_command(update, context)
+        return
     if SHARED_WORKER or generation_settings(update.effective_user.id).input_mode == "image":
         await image_worker_control(update, "start")
         return
@@ -633,6 +647,14 @@ async def service_start_command(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 async def service_restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if MANAGED_POOLS:
+        if not allowed(update.effective_user.id):
+            await update.message.reply_text("你不在使用白名单中。")
+            return
+        role = "image" if generation_settings(update.effective_user.id).input_mode == "image" else "video"
+        state = await asyncio.to_thread(worker_pools.restart_pool, role)
+        await update.message.reply_text("当前类别的 worker 会在已有任务完成后重启；另一类不受影响。\n" + worker_pools.describe(state))
+        return
     if SHARED_WORKER or generation_settings(update.effective_user.id).input_mode == "image":
         await image_worker_control(update, "restart")
         return
@@ -640,6 +662,15 @@ async def service_restart_command(update: Update, context: ContextTypes.DEFAULT_
 
 
 async def service_stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if MANAGED_POOLS:
+        if not allowed(update.effective_user.id):
+            await update.message.reply_text("你不在使用白名单中。")
+            return
+        role = "image" if generation_settings(update.effective_user.id).input_mode == "image" else "video"
+        await asyncio.to_thread(worker_pools.set_requested, **{role: 0})
+        state = await asyncio.to_thread(worker_pools.reconcile)
+        await update.message.reply_text("当前类别已设为 0 张卡；已有任务完成后释放 GPU，Bot 保持在线。\n" + worker_pools.describe(state))
+        return
     if SHARED_WORKER or generation_settings(update.effective_user.id).input_mode == "image":
         await image_worker_control(update, "stop")
         return
@@ -661,6 +692,9 @@ async def service_stop_command(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def on_service_gpu_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    if MANAGED_POOLS:
+        await query.answer("请用 /gpu 分别设置视频和图像卡数。", show_alert=True)
+        return
     if SHARED_WORKER:
         await query.answer("当前图像和视频共用一张卡，请用 /service_start 或 /service_restart。", show_alert=True)
         return
@@ -1317,6 +1351,9 @@ async def on_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def post_init(application):
     global TURBO_UNAVAILABLE, REFERENCE_TURBO_UNAVAILABLE, SUBMIT_LOCK
     SUBMIT_LOCK = asyncio.Lock()
+    if MANAGED_POOLS:
+        worker_pools.read_state()  # Defaults to 0/0 and never allocates implicitly.
+        application.bot_data["gpu_pool_task"] = asyncio.create_task(pool_bot.reconcile_loop())
     commands = [
         BotCommand("start", "使用说明"),
         BotCommand("mode", "修改你的模型、时长和台词语言"),
@@ -1326,11 +1363,13 @@ async def post_init(application):
         BotCommand("progress", "查看生成和排队进度"),
         BotCommand("id", "查看 Telegram ID"),
         BotCommand("cancel", "取消尚未提交的任务"),
-        BotCommand("service_start", "启动共享单卡服务" if SHARED_WORKER else "选择卡数并启动 GPU 服务"),
-        BotCommand("service_stop", "停止 GPU 服务并保持 Bot 在线"),
-        BotCommand("service_restart", "重启共享单卡服务" if SHARED_WORKER else "选择卡数并重启 GPU 服务"),
+        BotCommand("service_start", "分别分配视频和图像 GPU" if MANAGED_POOLS else "启动共享单卡服务" if SHARED_WORKER else "选择卡数并启动 GPU 服务"),
+        BotCommand("service_stop", "关闭当前类别，完成已有任务后释放卡" if MANAGED_POOLS else "停止 GPU 服务并保持 Bot 在线"),
+        BotCommand("service_restart", "已有任务完成后重启当前类别" if MANAGED_POOLS else "重启共享单卡服务" if SHARED_WORKER else "选择卡数并重启 GPU 服务"),
         BotCommand("stop", "危险：停止全部生成并清空队列"),
     ]
+    if MANAGED_POOLS:
+        commands.append(BotCommand("gpu", "分别设置视频／图像卡数，支持 0，视频优先"))
     for scope in (BotCommandScopeDefault(), BotCommandScopeAllPrivateChats()):
         await application.bot.delete_my_commands(scope=scope)
         await application.bot.set_my_commands(commands, scope=scope)
@@ -1373,7 +1412,7 @@ def main():
         raise RuntimeError("TG_BOT_TOKEN is not configured")
     request = HTTPXRequest(connection_pool_size=16, connect_timeout=30, read_timeout=60, write_timeout=60, pool_timeout=30, media_write_timeout=120)
     get_updates_request = HTTPXRequest(connection_pool_size=2, connect_timeout=30, read_timeout=70, write_timeout=60, pool_timeout=30)
-    application = Application.builder().token(TOKEN).request(request).get_updates_request(get_updates_request).concurrent_updates(True).post_init(post_init).build()
+    application = Application.builder().token(TOKEN).request(request).get_updates_request(get_updates_request).concurrent_updates(True).post_init(post_init).post_shutdown(pool_bot.shutdown).build()
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", start_command))
     application.add_handler(CommandHandler("mode", mode_command))
@@ -1388,6 +1427,9 @@ def main():
     application.add_handler(CommandHandler("service_start", service_start_command))
     application.add_handler(CommandHandler("service_stop", service_stop_command))
     application.add_handler(CommandHandler("service_restart", service_restart_command))
+    if MANAGED_POOLS:
+        application.add_handler(CommandHandler("gpu", pool_bot.gpu_command))
+        application.add_handler(CallbackQueryHandler(pool_bot.on_gpu, pattern=r"^pools:[1-9][0-9]*:[0-9a-f]{12}:(video|image|apply|refresh):[0-8]$"))
     application.add_handler(MessageHandler(filters.PHOTO, on_photo))
     application.add_handler(MessageHandler(filters.Document.ALL, on_photo))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_prompt_text))

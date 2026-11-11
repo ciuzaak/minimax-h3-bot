@@ -59,6 +59,7 @@ MODELSCOPE_PYTHON = env_executable("MODELSCOPE_PYTHON", sys.executable)
 BASE_PORT = int(os.environ.get("MINIMAX_BASE_PORT", "8190"))
 MAX_GPU_COUNT = int(os.environ.get("MINIMAX_MAX_GPU_COUNT", "8"))
 SHARED_WORKER = os.environ.get("MINIMAX_SHARED_WORKER", "0") == "1"
+MANAGED_POOLS = os.environ.get("MINIMAX_MANAGED_POOLS", "0") == "1"
 IMAGE_SERVER = f"http://127.0.0.1:{int(os.environ.get('MINIMAX_IMAGE_PORT', '8290'))}"
 
 

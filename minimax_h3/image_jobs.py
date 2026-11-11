@@ -11,7 +11,7 @@ import sys
 import uuid
 
 from . import jobs
-from .config import IMAGE_SERVER
+from .config import IMAGE_SERVER, MANAGED_POOLS
 
 SERVER = IMAGE_SERVER
 QUANTS = {
@@ -118,15 +118,34 @@ def build_prompt(job, index=1):
                         prompt_enhancement="off", vae_decode="VAEDecode")
 
 
-def check_support(quant="w4a8"):
+def check_servers():
+    if not MANAGED_POOLS:
+        candidates = [SERVER]
+    else:
+        from .worker_pools import servers
+        candidates = servers("image")
+    available = []
+    for server in candidates:
+        try:
+            jobs.request_json(f"{server}/system_stats", timeout=0.5)
+            available.append(server)
+        except Exception:
+            continue
+    if not available:
+        raise jobs.NoWorkersAvailable("图像服务未分配 GPU 或正在启动，请用 /gpu 分配图像卡数。")
+    return available
+
+
+def check_support(quant="w4a8", server=None):
     issues = []
     try:
-        jobs.request_json(f"{SERVER}/system_stats", timeout=3)
-        info = jobs.request_json(f"{SERVER}/object_info/MiniMaxH3ImageConditioning", timeout=3)
+        server = server or (jobs.select_server(check_servers()) if MANAGED_POOLS else SERVER)
+        jobs.request_json(f"{server}/system_stats", timeout=3)
+        info = jobs.request_json(f"{server}/object_info/MiniMaxH3ImageConditioning", timeout=3)
         if "MiniMaxH3ImageConditioning" not in info:
             issues.append("Image worker 缺少 MiniMaxH3ImageConditioning，需要 ComfyUI 0.45+")
         for category, name in (("diffusion_models", QUANTS[quant]), ("text_encoders", CLIP), ("vae", VAE)):
-            if name not in jobs.request_json(f"{SERVER}/models/{category}", timeout=3):
+            if name not in jobs.request_json(f"{server}/models/{category}", timeout=3):
                 issues.append(f"Image worker 缺少 {name}")
     except Exception as error:
         issues.append(f"图像服务不可用，请运行 bin/minimax-h3-image-service start：{error}")
@@ -134,17 +153,26 @@ def check_support(quant="w4a8"):
 
 
 def submit_job(job, index=1):
+    if MANAGED_POOLS:
+        from .worker_pools import allocation_lock
+        with allocation_lock():
+            return _submit_job(job, index)
+    return _submit_job(job, index)
+
+
+def _submit_job(job, index):
     prompt, metadata = build_prompt(job, index)
-    issues = check_support(metadata["image_quant"])
+    server = jobs.select_server(check_servers()) if MANAGED_POOLS else SERVER
+    issues = check_support(metadata["image_quant"], server)
     if issues:
         raise RuntimeError("；".join(issues))
     import time
     submitted_at_ms = round(time.time() * 1000)
-    response = jobs.request_json(f"{SERVER}/prompt", {"prompt": prompt, "client_id": str(uuid.uuid4()),
+    response = jobs.request_json(f"{server}/prompt", {"prompt": prompt, "client_id": str(uuid.uuid4()),
                                 "extra_data": {"minimax_h3_recipe": metadata}})
     if "prompt_id" not in response:
         raise RuntimeError(f"Image submission rejected: {response}")
-    return dict(metadata, server=SERVER, prompt_id=response["prompt_id"], status="queued", submitted_at_ms=submitted_at_ms)
+    return dict(metadata, server=server, prompt_id=response["prompt_id"], status="queued", submitted_at_ms=submitted_at_ms)
 
 
 def main():

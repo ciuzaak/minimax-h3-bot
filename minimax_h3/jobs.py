@@ -15,7 +15,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
-from .config import BASE_PORT, COMFY_DIR, IMAGE_SERVER, LOG_DIR, MAX_GPU_COUNT, MODEL_DIR, OUTPUT_DIR, SHARED_WORKER
+from .config import BASE_PORT, COMFY_DIR, IMAGE_SERVER, LOG_DIR, MANAGED_POOLS, MAX_GPU_COUNT, MODEL_DIR, OUTPUT_DIR, SHARED_WORKER
 from . import reference_trial
 
 
@@ -272,6 +272,11 @@ def sampler_progress(server):
     port = int(server.rsplit(":", 1)[1])
     gpu = port - BASE_PORT
     log_path = LOG_DIR / f"minimax-h3-service-gpu{gpu}.log"
+    if MANAGED_POOLS:
+        from .worker_pools import read_state
+        worker = next((w for w in read_state()["workers"] if w["server"] == server), None)
+        if worker:
+            log_path = Path(worker["log"])
     if SHARED_WORKER and server == IMAGE_SERVER:
         log_path = LOG_DIR / "minimax-h3-image.log"
     try:
@@ -312,14 +317,20 @@ class NoWorkersAvailable(RuntimeError):
 
 
 def check_servers():
+    candidates = [IMAGE_SERVER] if SHARED_WORKER else POSSIBLE_SERVERS
+    if MANAGED_POOLS:
+        from .worker_pools import servers
+        candidates = servers("video")
     available = []
-    for server in ([IMAGE_SERVER] if SHARED_WORKER else POSSIBLE_SERVERS):
+    for server in candidates:
         try:
             request_json(f"{server}/system_stats", timeout=0.5)
         except Exception:
             continue
         available.append(server)
     if not available:
+        if MANAGED_POOLS:
+            raise NoWorkersAvailable("视频服务未分配 GPU、正在启动或退出中，请用 /gpu 分配视频卡数。")
         if SHARED_WORKER:
             raise NoWorkersAvailable(f"Shared image/video worker is offline: {IMAGE_SERVER}")
         raise NoWorkersAvailable(
@@ -378,8 +389,16 @@ def check_reference_support(servers=None, accelerated=False, reference_mode=None
 
 
 def submit_job(job, index):
+    if MANAGED_POOLS:
+        from .worker_pools import allocation_lock
+        with allocation_lock():
+            return _submit_job(job, index)
+    return _submit_job(job, index)
+
+
+def _submit_job(job, index):
     prompt, metadata = build_prompt(job, index)
-    server = select_server(SERVERS)
+    server = select_server(check_servers() if MANAGED_POOLS else SERVERS)
     if job.get("task") == "reference":
         issues = check_reference_support([server], metadata["accelerated"], metadata["reference_mode"])
         if issues:

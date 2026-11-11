@@ -368,6 +368,24 @@ status_service() {
     fi
 }
 
+if [ "${MINIMAX_MANAGED_POOLS:-0}" = 1 ]; then
+    pool_command=("$BOT_PYTHON" -m minimax_h3.worker_pools)
+    export PYTHONPATH="$PROJECT_DIR${PYTHONPATH:+:$PYTHONPATH}"
+    case "${1:-status}" in
+        start)
+            if [ -n "${2:-}" ]; then "${pool_command[@]}" set --video "$2"; else "${pool_command[@]}" reconcile; fi
+            start_bot; exit 0 ;;
+        restart) stop_service; start_bot; exit 0 ;;
+        pools-set) "${pool_command[@]}" set --video "${2:?video count required}" --image "${3:?image count required}"; exit 0 ;;
+        pools-status|workers-status) "${pool_command[@]}" status; exit 0 ;;
+        status) "${pool_command[@]}" status; status_service; exit 0 ;;
+        workers-start) "${pool_command[@]}" set --video "${2:-1}"; exit 0 ;;
+        workers-stop) "${pool_command[@]}" set --video 0; exit 0 ;;
+        workers-restart) "${pool_command[@]}" restart --role video; exit 0 ;;
+        stop) "${pool_command[@]}" set --video 0 --image 0; echo "Workers drain existing jobs; Bot remains online."; exit 0 ;;
+    esac
+fi
+
 # A single ComfyUI queue loads/unloads image and video models on the same GPU.
 # Route every worker command here so stale Bot panels or CLI calls cannot add GPUs.
 if [ "${MINIMAX_SHARED_WORKER:-0}" = 1 ]; then

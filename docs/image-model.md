@@ -4,6 +4,8 @@
 
 ## 24GB RTX 4090 配置
 
+Bot 可通过 [独立 GPU 分配面板](gpu-pools.md) 分别设置图像和视频的卡数，均支持 0；视频优先，默认不分卡。该管理方式通过 `MINIMAX_MANAGED_POOLS=1` 启用，优先于下述共享单卡模式。
+
 | 组件 | 选择 | 下载量 | 复用情况 |
 | --- | --- | --- | --- |
 | DiT | `minimax_h3_image_pruned_w4a8.safetensors` | 12.55 GB | 新下载，24GB 默认 |
