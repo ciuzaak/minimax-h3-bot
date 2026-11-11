@@ -6,6 +6,7 @@ import secrets
 import time
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import BadRequest
 
 from .config import MAX_GPU_COUNT
 from . import worker_pools as pools
@@ -82,8 +83,12 @@ async def on_gpu(update, context):
             panel["version"] = state["version"]
         if action != "apply":
             await query.answer("尚未应用" if action in pools.ROLES else "已刷新")
-        await query.edit_message_text(panel_text(state, panel["draft"]),
-                                      reply_markup=keyboard(panel["owner"], token, panel["draft"]))
+        try:
+            await query.edit_message_text(panel_text(state, panel["draft"]),
+                                          reply_markup=keyboard(panel["owner"], token, panel["draft"]))
+        except BadRequest as error:
+            if "message is not modified" not in str(error).lower():
+                raise
 
 
 async def reconcile_loop():
