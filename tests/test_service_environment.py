@@ -9,6 +9,31 @@ import unittest
 
 
 class ServiceEnvironmentTest(unittest.TestCase):
+    def test_image_deploy_session_is_not_mistaken_for_running_image_worker(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            tmux = root / "tmux"
+            tmux.write_text("""#!/usr/bin/env python3
+import sys
+args = sys.argv[1:]
+assert args[0] == 'has-session', 'No worker should be launched when GPUs are unavailable'
+# tmux prefix matching finds image-deploy; exact matching finds no image session.
+sys.exit(1 if args[2] == '=minimax-h3-image' else 0)
+""")
+            smi = root / "nvidia-smi"
+            smi.write_text("#!/usr/bin/env bash\nexit 0\n")
+            tmux.chmod(0o700)
+            smi.chmod(0o700)
+            script = Path(__file__).resolve().parents[1] / "bin/minimax-h3-image-service"
+            env = dict(os.environ, PATH=str(root) + os.pathsep + os.environ["PATH"],
+                       MINIMAX_ENV_FILE="/dev/null", MINIMAX_IMAGE_SESSION="minimax-h3-image")
+            env.pop("MINIMAX_IMAGE_GPU", None)
+            result = subprocess.run(["bash", str(script), "start"], env=env,
+                                    capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("No idle GPU", result.stderr)
+            self.assertNotIn("already running", result.stdout)
+
     def test_bot_child_uses_resolved_credentials_and_preserves_caller_priority(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)

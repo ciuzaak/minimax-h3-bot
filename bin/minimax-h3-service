@@ -114,6 +114,11 @@ discover_available_gpus() {
     while IFS= read -r gpu; do
         gpu="${gpu//[[:space:]]/}"
         [[ "$gpu" =~ ^[0-9]+$ ]] || continue
+        # A container's process list may omit GPU processes owned by the host.
+        memory_used=$(nvidia-smi -i "$gpu" --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null || echo 999999)
+        if [ "$memory_used" -ge 512 ] && ! [[ "$own_worker_gpus" == *" $gpu "* ]]; then
+            continue
+        fi
         process_count=0
         while IFS= read -r process_pid; do
             process_pid="${process_pid//[[:space:]]/}"

@@ -19,6 +19,10 @@ class GenerationSettings:
     dialogue_language: str = "Chinese"
     input_mode: str = "i2v"
     reference_mode: str = "standard"
+    image_profile: str = "native"
+    image_ratio: str = "1:1"
+    image_quant: str = "w4a8"
+    image_edit_size: str = "input"
 
     def __post_init__(self):
         if self.mode not in ("fast", "standard", "trial8") or (self.mode == "trial8" and self.input_mode != "reference"):
@@ -27,10 +31,18 @@ class GenerationSettings:
             raise ValueError("Unsupported duration")
         if self.dialogue_language not in LANGUAGES:
             raise ValueError("Unsupported dialogue language")
-        if self.input_mode not in ("i2v", "reference"):
+        if self.input_mode not in ("i2v", "reference", "image"):
             raise ValueError("Unsupported input mode")
         if self.reference_mode not in ("fast", "standard", "trial8"):
             raise ValueError("Unsupported reference mode")
+        if self.image_profile not in ("preview", "balanced", "native"):
+            raise ValueError("Unsupported image profile")
+        if self.image_ratio not in ("1:1", "4:3", "3:4", "16:9", "9:16"):
+            raise ValueError("Unsupported image ratio")
+        if self.image_quant not in ("int8", "w4a8"):
+            raise ValueError("Unsupported image quantization")
+        if self.image_edit_size not in ("input", "canvas"):
+            raise ValueError("Unsupported image edit sizing")
 
 
 def normalize_settings(data, default: GenerationSettings) -> GenerationSettings:
@@ -43,8 +55,12 @@ def normalize_settings(data, default: GenerationSettings) -> GenerationSettings:
         mode=mode if mode in ("fast", "standard") else default.mode,
         seconds=seconds if type(seconds) is int and seconds in DURATIONS else default.seconds,
         dialogue_language=language if language in LANGUAGES else default.dialogue_language,
-        input_mode=data.get("input_mode") if data.get("input_mode") in ("i2v", "reference") else default.input_mode,
+        input_mode=data.get("input_mode") if data.get("input_mode") in ("i2v", "reference", "image") else default.input_mode,
         reference_mode=data.get("reference_mode") if data.get("reference_mode") in ("fast", "standard", "trial8") else default.reference_mode,
+        image_profile=data.get("image_profile") if data.get("image_profile") in ("preview", "balanced", "native") else default.image_profile,
+        image_ratio=data.get("image_ratio") if data.get("image_ratio") in ("1:1", "4:3", "3:4", "16:9", "9:16") else default.image_ratio,
+        image_quant=data.get("image_quant") if data.get("image_quant") in ("int8", "w4a8") else default.image_quant,
+        image_edit_size=data.get("image_edit_size") if data.get("image_edit_size") in ("input", "canvas") else default.image_edit_size,
     )
 
 

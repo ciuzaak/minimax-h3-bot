@@ -77,6 +77,35 @@ class ReferenceBotTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("<Picture 2>", media[1].caption)
         self.assertTrue(all(item.has_spoiler for item in media))
 
+    async def test_original_document_preserves_source_dimensions_through_edit_snapshot(self):
+        from PIL import Image
+        from minimax_h3 import image_jobs
+        self.preferences.update(1, input_mode="image")
+        update = self.update(10, album=None)
+
+        async def download(path):
+            Image.new("RGB", (1001, 777), "red").save(path)
+
+        file = SimpleNamespace(download_to_drive=AsyncMock(side_effect=download))
+        update.message.document = SimpleNamespace(file_name="source.png", file_size=5000,
+                                                   get_file=AsyncMock(return_value=file))
+        await self.upload([update])
+        state = bot.ACTIVE_IMAGES[(11, 1)]
+        path = image_paths(state)[0]
+        self.assertEqual(image_jobs.source_size(path), (1001, 777))
+        self.assertTrue(state["images"][0]["original_file"])
+        restored = bot.INPUT_STORE.load({1})[(11, 1)]
+        self.assertTrue(restored["images"][0]["original_file"])
+        prompt = self.update(20, album=None)
+        prompt.message.text = "Edit <Picture 1>: change red to blue."
+        await bot.on_prompt_text(prompt, self.context)
+        pending = next(iter(bot.PENDING_COUNT.values()))
+        self.preferences.update(1, image_edit_size="canvas", image_ratio="9:16")
+        self.assertEqual(pending["image_edit_size"], "input")
+        job = image_jobs.normalize_job(pending)
+        self.assertEqual((job["width"], job["height"]), (1001, 777))
+        self.assertIn("1001×777", prompt.message.reply_text.call_args.args[0])
+
     async def test_over_limit_rejects_whole_batch_and_preserves_old_inputs(self):
         original = self.state(8)
         bot.ACTIVE_IMAGES[(11, 1)] = original

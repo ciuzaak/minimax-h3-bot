@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+set -euo pipefail
+PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+if [ -f "${MINIMAX_ENV_FILE:-$PROJECT_DIR/.env}" ]; then
+    set -a
+    . "${MINIMAX_ENV_FILE:-$PROJECT_DIR/.env}"
+    set +a
+fi
+: "${MINIMAX_IMAGE_COMFY_DIR:=$PROJECT_DIR/.runtime/ComfyUI-image}"
+: "${COMFY_PYTHON:=python3}"
+: "${MINIMAX_IMAGE_PYTHON:=$COMFY_PYTHON}"
+: "${MINIMAX_IMAGE_PORT:=8290}"
+: "${MINIMAX_IMAGE_RESERVE_VRAM:=3}"
+: "${MINIMAX_LOG_DIR:=$PROJECT_DIR/logs}"
+: "${MINIMAX_OUTPUT_DIR:=$PROJECT_DIR/output}"
+: "${MINIMAX_MODEL_PATHS_CONFIG:=$PROJECT_DIR/.runtime/extra_model_paths.yaml}"
+: "${COMFY_DIR:=$PROJECT_DIR/../ComfyUI}"
+SESSION="${MINIMAX_IMAGE_SESSION:-minimax-h3-image}"
+case "${1:-status}" in
+    start)
+        if tmux has-session -t "=$SESSION" 2>/dev/null; then
+            echo "Image worker already running."
+            exit 0
+        fi
+        gpu="${MINIMAX_IMAGE_GPU:-}"
+        if [ -z "$gpu" ]; then
+            gpu=$(nvidia-smi --query-gpu=index,memory.used,utilization.gpu --format=csv,noheader,nounits | awk -F, '$2 < 512 && $3 < 10 {gsub(/ /,"",$1); print $1; exit}')
+        fi
+        [[ "$gpu" =~ ^[0-9]+$ ]] || { echo "No idle GPU available." >&2; exit 1; }
+        usage=$(nvidia-smi -i "$gpu" --query-gpu=memory.used --format=csv,noheader,nounits)
+        [ "$usage" -lt 512 ] || { echo "GPU $gpu is busy; image worker not started." >&2; exit 1; }
+        [ -f "$MINIMAX_IMAGE_COMFY_DIR/main.py" ] || { echo "Set up MINIMAX_IMAGE_COMFY_DIR first; see docs/image-model.md." >&2; exit 1; }
+        PYTHONPATH="$PROJECT_DIR" "$MINIMAX_IMAGE_PYTHON" -c 'from minimax_h3.config import ensure_model_paths_config; ensure_model_paths_config()'
+        mkdir -p "$MINIMAX_LOG_DIR" "$MINIMAX_OUTPUT_DIR" "$COMFY_DIR/input"
+        command=(env "CUDA_VISIBLE_DEVICES=$gpu" "PYTORCH_ALLOC_CONF=expandable_segments:True"
+            "$MINIMAX_IMAGE_PYTHON" "$MINIMAX_IMAGE_COMFY_DIR/main.py"
+            --listen 127.0.0.1 --port "$MINIMAX_IMAGE_PORT" --lowvram
+            --reserve-vram "$MINIMAX_IMAGE_RESERVE_VRAM"
+            --input-directory "$COMFY_DIR/input" --output-directory "$MINIMAX_OUTPUT_DIR"
+            --extra-model-paths-config "$MINIMAX_MODEL_PATHS_CONFIG"
+            --disable-auto-launch --disable-all-custom-nodes --database-url 'sqlite:///:memory:')
+        printf -v launch '%q ' "${command[@]}"
+        printf -v logfile '%q' "$MINIMAX_LOG_DIR/minimax-h3-image.log"
+        tmux new-session -d -s "$SESSION" -n image "exec $launch > $logfile 2>&1"
+        tmux set-environment -t "=$SESSION" MINIMAX_IMAGE_GPU "$gpu"
+        echo "Image worker starting: GPU $gpu, port $MINIMAX_IMAGE_PORT."
+        for attempt in $(seq 1 60); do
+            if curl -fsS "http://127.0.0.1:$MINIMAX_IMAGE_PORT/system_stats" >/dev/null 2>&1; then
+                echo "Image worker ready."
+                exit 0
+            fi
+            tmux has-session -t "=$SESSION" 2>/dev/null || { tail -15 "$MINIMAX_LOG_DIR/minimax-h3-image.log"; exit 1; }
+            sleep 1
+        done
+        echo "Image worker startup timed out; check $MINIMAX_LOG_DIR/minimax-h3-image.log." >&2
+        exit 1
+        ;;
+    stop) if tmux has-session -t "=$SESSION" 2>/dev/null; then tmux kill-session -t "=$SESSION"; fi ;;
+    restart) "$0" stop; "$0" start ;;
+    status) curl -fsS "http://127.0.0.1:$MINIMAX_IMAGE_PORT/system_stats" ;;
+    *) echo "Usage: $0 {start|stop|restart|status}" >&2; exit 2 ;;
+esac
