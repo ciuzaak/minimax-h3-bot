@@ -15,9 +15,10 @@ from pathlib import Path
 from .config import BASE_PORT, BOT_INPUT_DIR, LOG_DIR, MANAGED_POOLS, PROJECT_DIR, SHARED_WORKER
 from .preferences import GenerationSettings, PreferenceStore
 from .input_sets import InputStore, collection_state, image_entries, image_paths
+from .prompt_file import parse_prompt_file
 
 from telegram import BotCommand, BotCommandScopeAllPrivateChats, BotCommandScopeDefault, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Update
-from telegram.error import BadRequest, NetworkError, TimedOut
+from telegram.error import BadRequest, NetworkError, TelegramError, TimedOut
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 from telegram.request import HTTPXRequest
 
@@ -62,6 +63,7 @@ DIALOGUE_LANGUAGE_BUTTONS = {
     "none": "🚫",
 }
 BOT_DURATION_OPTIONS = (5, 10, 15)
+TELEGRAM_DOWNLOAD_LIMIT = 20 * 1024 * 1024
 H3_CONTROL_TAG_PATTERN = re.compile(
     r"^(?:/?d|scenetrans|cutoff|(?:Picture|Subject|Video|Audio)\s+[1-9][0-9]*)$"
 )
@@ -442,6 +444,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"   {dialogue_conversion_description(settings)}\n"
         f"3. 你的当前设置：{settings_label(settings)}；使用 /mode 修改模型、时长和自动台词语言，/language 可直接打开同一设置面板。\n"
         "4. 选择生成 1–8 条；也可在提示词末尾写 xN（如 x12）直接指定任意正整数数量。\n"
+        "   批量任务请用 .txt 文件发送，以空行分组。每组末尾可写 xN，省略时生成 1 条（或 1 张）。\n"
         "5. 每条视频生成好后会立即发回，并显示生成和排队耗时。\n"
         "6. 多图参考会追加图片；单图首帧会替换图片。/images 查看编号、删除与排序，/images clear 清空；等待编号预览后再发提示词。\n"
         "7. 使用 /progress 查看各 GPU worker 的生成和排队进度。\n"
@@ -933,7 +936,7 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if suffix not in {".jpg", ".jpeg", ".png", ".webp"}:
             await update.message.reply_text("原图文件支持 PNG、JPEG 和 WebP。")
             return
-        if document.file_size and document.file_size > 20 * 1024 * 1024:
+        if document.file_size and document.file_size > TELEGRAM_DOWNLOAD_LIMIT:
             await update.message.reply_text("这个文件超过 Telegram Bot 当前可下载的 20MB 上限，请提供较小的原图文件。")
             return
     loop = asyncio.get_running_loop()
@@ -986,6 +989,39 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             discard_image(image_path)
 
 
+def validate_video_inputs(settings, state, paths):
+    if state is None:
+        raise ValueError("请先发送一张图片。")
+    if settings.input_mode == "i2v" and len(paths) != 1:
+        raise ValueError("单图首帧只能使用一张图。请在 /mode 切回多图参考，或用 /images 删除多余图片。")
+    if settings.input_mode == "reference" and len(paths) > submit.MAX_REFERENCE_IMAGES:
+        raise ValueError("视频参考最多 9 张图；请先用 /images 删除多余图片，或切回 H3-Image。")
+
+
+def video_prompt_batch(state, settings, paths, raw_prompt):
+    if not raw_prompt:
+        raise ValueError("没有读到有效提示词，请重新输入。")
+    if any(not 1 <= int(number) <= len(paths) for number in re.findall(r"<Picture\s+([0-9]+)>", raw_prompt)):
+        raise ValueError("提示词引用了尚未上传的图片编号，请用 /images 核对。")
+    if re.search(r"<(?:Video|Audio)\s+[1-9][0-9]*>", raw_prompt):
+        raise ValueError("当前 Bot 尚未接入参考视频或参考音频；请先使用图片参考，不能只靠标签传入视频或音频。")
+    if settings.dialogue_language != "none" and not validate_angle_brackets(raw_prompt):
+        raise ValueError("检测到未严格匹配的 < >。请确保每段台词都写成完整的 <台词>，不能缺少、多余、嵌套或留空。也可以在 /language 中选择“无”后手写 H3 对白标签。")
+    prompt, dialogue_expanded = expand_dialogue_prompt(raw_prompt, settings.dialogue_language)
+    batch = dict(state, prompt=prompt, display_prompt=raw_prompt, image_paths=paths,
+                 task=settings.input_mode, accelerated=settings.mode != "standard", seconds=settings.seconds)
+    if settings.input_mode == "reference":
+        batch["reference_mode"] = settings.mode
+    return batch, dialogue_expanded
+
+
+def image_prompt_batch(key, settings, paths, prompt):
+    return dict(chat_id=key[0], user_id=key[1], task="image", image_paths=paths, prompt=prompt,
+                display_prompt=prompt, seconds=0, image_profile=settings.image_profile,
+                image_ratio=settings.image_ratio, image_quant=settings.image_quant,
+                image_edit_size=settings.image_edit_size)
+
+
 async def on_prompt_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed(update.effective_user.id):
         await update.message.reply_text("你不在使用白名单中。")
@@ -999,47 +1035,18 @@ async def on_prompt_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if settings.input_mode == "image":
         await on_image_prompt(update, context, settings, state)
         return
-    if state is None:
-        await update.message.reply_text("请先发送一张图片。")
+    paths = image_paths(state) if state else ()
+    try:
+        validate_video_inputs(settings, state, paths)
+    except ValueError as error:
+        await update.message.reply_text(str(error))
         return
-    paths = image_paths(state)
-    if settings.input_mode == "i2v" and len(paths) != 1:
-        await update.message.reply_text("单图首帧只能使用一张图。请在 /mode 切回多图参考，或用 /images 删除多余图片。")
+    try:
+        raw_prompt, requested_count = submit.extract_prompt_count(update.message.text)
+        state, dialogue_expanded = video_prompt_batch(state, settings, paths, raw_prompt)
+    except ValueError as error:
+        await send_text_with_retry(context.bot, key[0], str(error))
         return
-    if settings.input_mode == "reference" and len(paths) > submit.MAX_REFERENCE_IMAGES:
-        await update.message.reply_text("视频参考最多 9 张图；请先用 /images 删除多余图片，或切回 H3-Image。")
-        return
-
-    raw_prompt, requested_count = submit.extract_prompt_count(update.message.text)
-    if not raw_prompt:
-        await send_text_with_retry(context.bot, update.effective_chat.id, "没有读到有效提示词，请重新输入。")
-        return
-    if any(not 1 <= int(number) <= len(paths) for number in re.findall(r"<Picture\s+([0-9]+)>", raw_prompt)):
-        await update.message.reply_text("提示词引用了尚未上传的图片编号，请用 /images 核对。")
-        return
-    if re.search(r"<(?:Video|Audio)\s+[1-9][0-9]*>", raw_prompt):
-        await update.message.reply_text("当前 Bot 尚未接入参考视频或参考音频；请先使用图片参考，不能只靠标签传入视频或音频。")
-        return
-    if settings.dialogue_language != "none" and not validate_angle_brackets(raw_prompt):
-        await send_text_with_retry(
-            context.bot,
-            update.effective_chat.id,
-            "检测到未严格匹配的 < >。请确保每段台词都写成完整的 <台词>，不能缺少、多余、嵌套或留空。也可以在 /language 中选择“无”后手写 H3 对白标签。",
-        )
-        return
-    prompt, dialogue_expanded = expand_dialogue_prompt(raw_prompt, settings.dialogue_language)
-
-    batch_key = secrets.token_hex(6)
-    state = dict(state)
-    state["prompt"] = prompt
-    state["display_prompt"] = raw_prompt
-    state["requested_count"] = requested_count
-    state["image_paths"] = paths
-    state["task"] = settings.input_mode
-    state["accelerated"] = settings.mode != "standard"
-    if settings.input_mode == "reference":
-        state["reference_mode"] = settings.mode
-    state["seconds"] = settings.seconds
     for path in paths:
         acquire_image(path)
     selected_mode = batch_mode(state)
@@ -1056,6 +1063,7 @@ async def on_prompt_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    batch_key = secrets.token_hex(6)
     PENDING_COUNT[batch_key] = state
     await send_text_with_retry(
         context.bot,
@@ -1064,6 +1072,85 @@ async def on_prompt_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         + f"当前使用 {mode_label(selected_mode, state['task'])} · {len(paths)} 张图 · {state['seconds']} 秒。请选择生成多少条视频：",
         reply_markup=count_keyboard(batch_key),
     )
+
+
+def prepare_prompt_file(content, key, settings, state, paths):
+    prompts = parse_prompt_file(content)
+    if settings.input_mode != "image":
+        if any(not Path(path).is_file() for path in paths):
+            raise ValueError("参考图片已不存在，请重新上传。")
+        submit.image_resolution(paths[0], state["width"], state["height"])
+
+    batches = []
+    for number, (prompt, count) in enumerate(prompts, 1):
+        try:
+            if settings.input_mode == "image":
+                batch = image_prompt_batch(key, settings, paths, prompt)
+                image_jobs.normalize_job(batch)
+            else:
+                batch, _ = video_prompt_batch(state, settings, paths, prompt)
+        except (ValueError, TypeError, OSError) as error:
+            raise ValueError(f"第 {number} 组提示词有误。{error}") from error
+        batches.append((batch, count))
+    return batches
+
+
+async def on_prompt_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.message
+    if message is None:
+        return
+    key = user_key(update)
+    if not allowed(key[1]):
+        await message.reply_text("你不在使用白名单中。")
+        return
+    document = message.document
+    if (document.file_size or 0) > TELEGRAM_DOWNLOAD_LIMIT:
+        await message.reply_text("批量文件超过 Telegram Bot 可下载的 20MB 上限。")
+        return
+    if key in UPLOAD_BATCHES:
+        await message.reply_text("图片收集中，请等待编号预览后再发送批量文件。")
+        return
+
+    settings = generation_settings(key[1])
+    state = ACTIVE_IMAGES.get(key)
+    paths = image_paths(state) if state else ()
+    if settings.input_mode != "image":
+        try:
+            validate_video_inputs(settings, state, paths)
+        except ValueError as error:
+            await message.reply_text(str(error))
+            return
+
+    # Hold the snapshot across the download and validation, even if /images replaces it.
+    for path in paths:
+        acquire_image(path)
+    try:
+        try:
+            telegram_file = await document.get_file()
+            content = await telegram_file.download_as_bytearray()
+        except (TelegramError, OSError, RuntimeError):
+            await message.reply_text("批量文件下载失败，请重新发送。")
+            return
+
+        try:
+            batches = await asyncio.to_thread(prepare_prompt_file, content, key, settings, state, paths)
+        except (ValueError, OSError) as error:
+            await message.reply_text(f"整批未提交。{error}")
+            return
+        finally:
+            del content
+
+        for batch, count in batches:
+            for path in paths:
+                acquire_image(path)
+            context.application.create_task(submit_batch(context.application, batch, batch["seconds"], count))
+    finally:
+        for path in paths:
+            release_image(path)
+
+    unit = "张图像" if settings.input_mode == "image" else "条视频"
+    total = sum(count for _, count in batches)
+    await message.reply_text(f"已校验 {len(batches)} 组提示词，共 {total} {unit}，正在提交。")
 
 
 async def image_worker_control(update, action):
@@ -1092,10 +1179,7 @@ async def image_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def on_image_prompt(update, context, settings, state):
     paths = image_paths(state) if state else ()
     prompt, count = submit.extract_prompt_count(update.message.text)
-    batch = dict(chat_id=update.effective_chat.id, user_id=update.effective_user.id,
-                 task="image", image_paths=paths, prompt=prompt, display_prompt=prompt,
-                 seconds=0, image_profile=settings.image_profile, image_ratio=settings.image_ratio,
-                 image_quant=settings.image_quant, image_edit_size=settings.image_edit_size)
+    batch = image_prompt_batch(user_key(update), settings, paths, prompt)
     try:
         normalized = image_jobs.normalize_job(batch)
     except (ValueError, TypeError, OSError) as error:
@@ -1132,15 +1216,21 @@ async def deliver_image(application, chat_id, record, output_path):
             await asyncio.sleep(2 ** attempt)
 
 
+def batch_seeds(count):
+    seeds = set()
+    while len(seeds) < count:
+        seed = secrets.randbelow(2 ** 64)
+        if seed not in seeds:
+            seeds.add(seed)
+            yield seed
+
+
 async def submit_image_batch(application, batch, count):
     records = []
     try:
         try:
             async with SUBMIT_LOCK:
-                seeds = set()
-                while len(seeds) < count:
-                    seeds.add(secrets.randbelow(2 ** 64))
-                for index, seed in enumerate(seeds, 1):
+                for index, seed in enumerate(batch_seeds(count), 1):
                     record = await asyncio.to_thread(image_jobs.submit_job, dict(batch, seed=seed), index)
                     record["prompt_text"] = batch["display_prompt"]
                     records.append(record)
@@ -1259,10 +1349,7 @@ async def submit_batch(application, batch, seconds, count):
             async with SUBMIT_LOCK:
                 servers = await asyncio.to_thread(submit.check_servers)
                 submit.SERVERS[:] = servers
-                seeds = set()
-                while len(seeds) < count:
-                    seeds.add(secrets.randbelow(2 ** 64))
-                for index, seed in enumerate(seeds, 1):
+                for index, seed in enumerate(batch_seeds(count), 1):
                     job = {
                         "image_path": batch["image_path"],
                         "prompt": batch["prompt"],
@@ -1431,6 +1518,7 @@ def main():
         application.add_handler(CommandHandler("gpu", pool_bot.gpu_command))
         application.add_handler(CallbackQueryHandler(pool_bot.on_gpu, pattern=r"^pools:[1-9][0-9]*:[0-9a-f]{12}:(video|image|apply|refresh):[0-8]$"))
     application.add_handler(MessageHandler(filters.PHOTO, on_photo))
+    application.add_handler(MessageHandler(filters.Document.FileExtension("txt"), on_prompt_file))
     application.add_handler(MessageHandler(filters.Document.ALL, on_photo))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_prompt_text))
     application.add_handler(CallbackQueryHandler(on_mode, pattern=r"^settings:(?:[1-9][0-9]*:)?(mode:(fast|standard|trial8)|seconds:(5|10|15)|language:(Chinese|Japanese|Korean|English|none)|input_mode:(i2v|reference|image)|image_profile:(preview|balanced|native)|image_ratio:(1-1|4-3|3-4|16-9|9-16)|image_quant:(int8|w4a8)|image_edit_size:(input|canvas))$"))
